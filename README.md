@@ -6,7 +6,7 @@ This repository contains `my_opt.c`, a complete optimizer for intermediate repre
 
 - Dominator analysis
 - Natural loop detection
-- Region hierarchy (Algorithm 9.52)
+- Region hierarchy
 - Block-level constant propagation with partial evaluation
 - Region-level constant propagation with fixpoint iteration
 - Full dead-code elimination
