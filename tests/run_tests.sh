@@ -25,8 +25,8 @@ LIB="$CCC/inter_library"
 build="$here/build"
 mkdir -p "$build/run"
 
-$CC -O2 -I"$LIB" "$here/my_opt.c" "$here/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/my_opt.exe" || exit 2
-$CC -O2 -I"$LIB" "$here/tests/ir_interp.c" "$here/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/ir_interp.exe" || exit 2
+$CC -O2 -I"$LIB" "$here/src/my_opt.c" "$here/src/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/my_opt.exe" || exit 2
+$CC -O2 -I"$LIB" "$here/tests/ir_interp.c" "$here/src/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/ir_interp.exe" || exit 2
 
 status=0
 for src in "$@"; do

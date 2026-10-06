@@ -1,4 +1,4 @@
-/* native_cases.c - runs tests/programs/cases.c compiled as ordinary C with the
+/* native_cases.c - runs tests/cases.c compiled as ordinary C with the
  * inputs ir_interp generates, and prints lines in ir_interp's format, so that the
  * interpreter can be checked against a C compiler:
  *
@@ -17,7 +17,7 @@
 #include <fcntl.h>
 #include <io.h>
 #endif
-#include "programs/cases.c"
+#include "cases.c"
 
 typedef long long i64;
 typedef unsigned long long u64;

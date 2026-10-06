@@ -1,5 +1,4 @@
-# tests/run_tests.sh on the course's sample programs and tests/programs/cases.c
-# CCC=<course files> RUNS=200 tests/run_tests.sh <program>.c ...   (2026-10-06)
+# tests/run_tests.sh on the 8 sample programs of the course and tests/cases.c, RUNS=200  (2026-10-06)
 
 == differential
    instructions 10, CFG edges 11, back edges 1 (loop statements 1), loop regions 1

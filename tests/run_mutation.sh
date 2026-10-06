@@ -1,14 +1,15 @@
 #!/bin/bash
 # run_mutation.sh - checks that the differential test detects mistakes.
 #
-#   CCC=<ccc dir> [CC="<c compiler>"] [PYTHON=python] [RUNS=50] tests/mutation/run_mutation.sh prog.ir ...
+#   CCC=<ccc dir> [CC="<c compiler>"] [PYTHON=python] [RUNS=50] tests/run_mutation.sh [prog.ir ...]
 #
 # Builds my_opt.c once per mutant in mutants.txt, optimizes every program with it
 # and compares the original and the mutant's result with ir_interp (every
 # function, RUNS seeds). A mutant is detected when at least one run differs.
-# Run tests/run_tests.sh first: it builds build/ir_interp.exe.
+# Run tests/run_tests.sh first: it builds build/ir_interp.exe, and with no
+# arguments the programs it translated (build/run/<prog>/<prog>.ir) are used.
 set -u
-here=$(cd "$(dirname "$0")/../.." && pwd)
+here=$(cd "$(dirname "$0")/.." && pwd)
 : "${CCC:?set CCC to the directory with inter_library/}"
 CC=${CC:-gcc}
 PYTHON=${PYTHON:-python}
@@ -17,12 +18,17 @@ LIB="$CCC/inter_library"
 interp="$here/build/ir_interp.exe"
 [ -x "$interp" ] || { echo "build/ir_interp.exe missing: run tests/run_tests.sh first"; exit 2; }
 
+if [ $# -eq 0 ]; then
+    for d in "$here"/build/run/*/; do p=$(basename "$d"); [ -f "$d/$p.ir" ] && set -- "$@" "$d/$p.ir"; done
+fi
+[ $# -gt 0 ] || { echo "no programs: give .ir files or run tests/run_tests.sh first"; exit 2; }
+
 detected=0; total=0
-for name in $(grep -v '^#' "$here/tests/mutation/mutants.txt" | sed 's/@@.*//'); do
+for name in $(grep -v '^#' "$here/tests/mutants.txt" | sed 's/@@.*//'); do
     m="$here/build/mutants/$name"
     mkdir -p "$m"
-    "$PYTHON" "$here/tests/mutation/mutate.py" "$here/my_opt.c" "$here/tests/mutation/mutants.txt" "$name" "$m/my_opt.c" || exit 2
-    $CC -O2 -w -I"$LIB" "$m/my_opt.c" "$here/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$m/my_opt.exe" || exit 2
+    "$PYTHON" "$here/tests/mutate.py" "$here/src/my_opt.c" "$here/tests/mutants.txt" "$name" "$m/my_opt.c" || exit 2
+    $CC -O2 -w -I"$LIB" "$m/my_opt.c" "$here/src/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$m/my_opt.exe" || exit 2
     sum=0; where=""
     for ir in "$@"; do
         prog=$(basename "$ir" .ir)
