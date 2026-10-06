@@ -1,23 +1,37 @@
-/* my_opt.c
+/* my_opt.c - optimizer for the intermediate representation (IR) of the CCC
+ * high-level-synthesis toolchain.
  *
- * Πλήρης βελτιστοποιητής ενδιάμεσης αναπαράστασης (IR)
- * με:
- *  - Dominator analysis
- *  - Natural loop detection
- *  - Ιεραρχία περιοχών (Alg. 9.52)
- *  - Block‐level CP με partial evaluation
- *  - Region‐level CP με fixpoint
- *  - Dead‐code elimination (πλήρης)
- *  - Copy propagation
- *  - Loop-invariant code motion
- *  - Strength reduction
- *  - Common subexpression elimination
- *  - Inline expansion
- *  - Peephole optimization
- *  - Control flow simplification
- *  - Στατιστικά: αριθμός εντολών πριν/μετά
- *  - Υποστήριξη TYPE_INT, TYPE_DOUBLE, TYPE_STRING
- *  - Πλήρης απελευθέρωση μνήμης
+ * Analyses (reported in the statistics)
+ *   - basic blocks: leaders are the first instruction, every jump target and
+ *     every instruction after a control instruction
+ *   - control-flow graph with predecessor and successor lists
+ *   - dominators (iterative bit-vector algorithm)
+ *   - natural loops (back edges whose target dominates their source)
+ *
+ * Transformations
+ *   1. jump cleanup: a goto to the very next instruction is removed
+ *   2. algebraic simplification: x+0, 0+x, x-0, x*1, 1*x, x<<0 (integer constants)
+ *   3. constant propagation: after x = c, uses of x become c
+ *   4. copy propagation: after x = y, uses of x become y
+ *   5. common-subexpression elimination: x = e; ... z = e becomes z = x
+ *   6. dead-code elimination: assignments to variables that are never read,
+ *      with no side effects on the right-hand side, are removed (repeated
+ *      until nothing changes)
+ *
+ * Safety rules (when in doubt, the IR is left unchanged)
+ *   - 3-5 are local: facts are discarded at every instruction that another
+ *     instruction points to (a possible jump target) and after every control
+ *     instruction, so they never cross a jump in either direction. This holds
+ *     whether the IR keeps branch and loop bodies in the main instruction list
+ *     or in separate lists; both kinds of list are processed.
+ *   - a function call, an assignment through a non-identifier left-hand side
+ *     (array element, pointer) or an assignment nested in an expression
+ *     discards all facts; any write to a variable discards the facts about it
+ *     and about every expression that uses it
+ *   - uses are rewritten only below + - * << , at the root of a right-hand side
+ *     and in call arguments; never on a left-hand side, under ++/--, or under
+ *     any other operator (for example address-of)
+ *   - an instruction that another instruction points to is never removed
  */
 
 #include <stdio.h>
@@ -28,868 +42,726 @@
 #include "intermediate.h"
 #include "irloadstore.h"
 
-#define WORD_SIZE (sizeof(unsigned)*8)
+#define WORD_SIZE (sizeof(unsigned) * 8)
 
+extern int subroutine_number;
 extern sub_struct *subroutines[];
+extern int i_node_number;
 
-// === Function prototypes for optimization phases ===
-static void control_flow_simplification(sub_struct *sub);
-static void peephole_optimization(sub_struct *sub);
-static void inline_expansion(sub_struct *sub);
-static void common_subexpression_elimination(sub_struct *sub);
-static void strength_reduction(sub_struct *sub);
-static void loop_invariant_code_motion(sub_struct *sub);
-static void copy_propagation(sub_struct *sub);
-static int count_instructions(sub_struct *sub);
+/* ======================= statistics ======================= */
+typedef struct {
+    int blocks, edges, loops;  /* analysis */
+    int jumps_removed, simplified, constants_propagated, copies_propagated, cse, dead_removed;
+} OptStats;
 
+static OptStats g_stats;
+int my_opt_verbose = 1;  /* print the [REPORT] lines */
 
-// ===================== COPY PROPAGATION =====================
-static void copy_propagation(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        if (!i->expression) continue;
-        expr_node *e = i->expression;
-        /* Εντολή τύπου x = y */
-        if (e->operator == ASSIGN && e->left && e->right &&
-            e->left->operator == IDENTIFIER && e->right->operator == IDENTIFIER) {
-            int src_idx = e->right->identifier->rec_index;
-            int dst_idx = e->left->identifier->rec_index;
-            /* Αντικατάσταση όλων των χρήσεων του dst με src στα επόμενα */
-            for (instr_node *j = i->next; j; j = j->next) {
-                if (!j->expression) continue;
-                expr_node *ex = j->expression;
-                /* Αντικατάσταση σε απλές εκφράσεις */
-                if (ex->operator == IDENTIFIER && ex->identifier && ex->identifier->rec_index == dst_idx) {
-                    ex->identifier->rec_index = src_idx;
-                }
-                /* Αντικατάσταση σε αριστερό/δεξί */
-                if (ex->left && ex->left->operator == IDENTIFIER && ex->left->identifier && ex->left->identifier->rec_index == dst_idx) {
-                    ex->left->identifier->rec_index = src_idx;
-                }
-                if (ex->right && ex->right->operator == IDENTIFIER && ex->right->identifier && ex->right->identifier->rec_index == dst_idx) {
-                    ex->right->identifier->rec_index = src_idx;
-                }
-            }
-        }
+/* ======================= expression helpers ======================= */
+static int is_assign_op(oper_t op) { return op >= ASSIGN && op <= ASSIGNXOR; }
+static int is_incdec(oper_t op) { return op == PREINC || op == PREDEC || op == POSTINC || op == POSTDEC; }
+static int is_pure_op(oper_t op) { return op == PLUSOP || op == MINUSOP || op == MULOP || op == LSHIFT; }
+
+static int is_ident(const expr_node *e) { return e && e->operator == IDENTIFIER && e->identifier; }
+
+static int const_equal(const const_struct *a, const const_struct *b) {
+    if (a == b) return 1;
+    if (!a || !b || a->const_type != b->const_type) return 0;
+    switch (a->const_type) {
+    case TYPE_INT: return a->ivalue == b->ivalue;
+    case TYPE_DOUBLE: return a->fvalue == b->fvalue;
+    case TYPE_STRING: return a->svalue && b->svalue && strcmp(a->svalue, b->svalue) == 0;
+    default: return 0;
     }
 }
 
-// ===================== LOOP-INVARIANT CODE MOTION =====================
-static void loop_invariant_code_motion(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        if (i->type == WHILE_LOOP || i->type == DO_LOOP || i->type == FOR_LOOP) {
-            instr_node *loop_head = i;
-            instr_node *loop_tail = i->tail_instruction;
-            /* Εντοπισμός loop-invariant εκφράσεων */
-            for (instr_node *j = loop_head->next; j && j != loop_tail; j = j->next) {
-                if (!j->expression) continue;
-                expr_node *e = j->expression;
-                /* Αν η έκφραση είναι σταθερή ή δεν εξαρτάται από μεταβλητές που αλλάζουν στο βρόχο */
-                if (e->operator == CONSTANT) {
-                    /* Μετακίνηση πριν το βρόχο */
-                    instr_node *prev = loop_head->parent;
-                    if (prev) {
-                        /* Απλή μετακίνηση: αποσύνδεση και επανασύνδεση */
-                        instr_node *tmp = j->next;
-                        if (prev->next == loop_head) {
-                            prev->next = j;
-                        }
-                        j->next = loop_head;
-                        loop_head->next = tmp;
-                        printf("[LOG] Moved loop-invariant instruction before loop.\n");
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ===================== STRENGTH REDUCTION =====================
-static void strength_reduction(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        if (!i->expression) continue;
-        expr_node *e = i->expression;
-        /* Εντοπισμός πολλαπλασιασμού με σταθερή δύναμη του 2 */
-        if (e->operator == MULOP && e->right && e->right->operator == CONSTANT) {
-            unsigned long long v = e->right->constant->ivalue;
-            if (v > 0 && (v & (v - 1)) == 0) { /* Είναι δύναμη του 2 */
-                int shift = 0;
-                while (v >>= 1) ++shift;
-                e->operator = LSHIFT;
-                e->right->operator = CONSTANT;
-                e->right->constant->ivalue = shift;
-                printf("[LOG] Strength reduction: replaced multiplication with shift (<< %d).\n", shift);
-            }
-        }
-    }
-}
-
-// ===================== COMMON SUBEXPRESSION ELIMINATION =====================
-static int expr_equal(expr_node *a, expr_node *b) {
-    if (!a || !b) return 0;
+/* Structural equality of pure expressions. */
+static int expr_equal(const expr_node *a, const expr_node *b) {
+    if (!a || !b) return a == b;
     if (a->operator != b->operator) return 0;
-    if (a->operator == CONSTANT && b->operator == CONSTANT)
-        return a->constant->ivalue == b->constant->ivalue;
-    if (a->operator == IDENTIFIER && b->operator == IDENTIFIER)
-        return a->identifier->rec_index == b->identifier->rec_index;
+    if (a->operator == CONSTANT) return const_equal(a->constant, b->constant);
+    if (a->operator == IDENTIFIER)
+        return a->identifier && b->identifier && a->identifier->rec_index == b->identifier->rec_index;
+    if (a->expression_list || b->expression_list) return 0;
     return expr_equal(a->left, b->left) && expr_equal(a->right, b->right);
 }
 
-static void common_subexpression_elimination(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        if (!i->expression) continue;
-        expr_node *e = i->expression;
-        /* Ψάχνουμε για ίδια έκφραση σε επόμενες εντολές */
-        for (instr_node *j = i->next; j; j = j->next) {
-            if (!j->expression) continue;
-            if (expr_equal(e, j->expression)) {
-                /* Αντικατάσταση της έκφρασης j με αναφορά στην έκφραση i */
-                j->expression = e;
-                printf("[LOG] Common subexpression eliminated.\n");
-            }
-        }
-    }
+/* An expression with no side effects made of identifiers, constants and + - * <<. */
+static int is_pure_expr(const expr_node *e) {
+    if (!e) return 0;
+    if (e->operator == CONSTANT) return e->constant != NULL;
+    if (e->operator == IDENTIFIER) return e->identifier != NULL;
+    if (!is_pure_op(e->operator) || e->expression_list) return 0;
+    return is_pure_expr(e->left) && is_pure_expr(e->right);
 }
 
-// ===================== INLINE EXPANSION =====================
-static void inline_expansion(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    /* Απλή υλοποίηση: για κάθε κλήση συνάρτησης (FUNCALL), αν η συνάρτηση έχει <=3 εντολές, αντικαθιστά την κλήση με το σώμα της. */
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        if (!i->expression) continue;
-        expr_node *e = i->expression;
-        if (e->operator == FUNCALL && e->left && e->left->operator == IDENTIFIER) {
-            int sub_idx = e->left->identifier->rec_index;
-            if (sub_idx >= 0 && sub_idx < MAX_SUBROUTINES && subroutines[sub_idx]) {
-                sub_struct *callee = subroutines[sub_idx];
-                int callee_instrs = 0;
-                for (instr_node *ci = callee->sub_first; ci; ci = ci->next) callee_instrs++;
-                if (callee_instrs > 0 && callee_instrs <= 3) {
-                    /* Inline: αντικατάσταση της κλήσης με τις εντολές της συνάρτησης */
-                    instr_node *after = i->next;
-                    instr_node *last = NULL;
-                    for (instr_node *ci = callee->sub_first; ci; ci = ci->next) {
-                        instr_node *copy = dup_instruction(ci, NULL, sub);
-                        if (last) last->next = copy;
-                        else i->next = copy;
-                        last = copy;
-                    }
-                    if (last) last->next = after;
-                    printf("[LOG] Inline expansion: replaced FUNCALL with callee body.\n");
-                }
-            }
-        }
-    }
+static int has_side_effects(const expr_node *e) {
+    if (!e) return 0;
+    if (e->operator == FUNCALL || is_assign_op(e->operator) || is_incdec(e->operator)) return 1;
+    if (has_side_effects(e->left) || has_side_effects(e->right)) return 1;
+    for (expr_list *L = e->expression_list; L; L = L->next)
+        if (has_side_effects(L->expression)) return 1;
+    return 0;
 }
 
-// ===================== PEEPHOLE OPTIMIZATION =====================
-static void peephole_optimization(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    for (instr_node *i = sub->sub_first; i && i->next; i = i->next) {
-        expr_node *e1 = i->expression;
-        expr_node *e2 = i->next->expression;
-        if (!e1 || !e2) continue;
-        /* Παράδειγμα: x = x + 0 -> x = x */
-        if (e1->operator == ASSIGN && e1->right && e1->right->operator == PLUSOP &&
-            e1->right->right && e1->right->right->operator == CONSTANT && e1->right->right->constant->ivalue == 0) {
-            e1->right = e1->right->left;
-            printf("[LOG] Peephole: replaced x = x + 0 with x = x.\n");
-        }
-        /* Παράδειγμα: x = x * 1 -> x = x */
-        if (e1->operator == ASSIGN && e1->right && e1->right->operator == MULOP &&
-            e1->right->right && e1->right->right->operator == CONSTANT && e1->right->right->constant->ivalue == 1) {
-            e1->right = e1->right->left;
-            printf("[LOG] Peephole: replaced x = x * 1 with x = x.\n");
-        }
-        /* Παράδειγμα: x = x - 0 -> x = x */
-        if (e1->operator == ASSIGN && e1->right && e1->right->operator == MINUSOP &&
-            e1->right->right && e1->right->right->operator == CONSTANT && e1->right->right->constant->ivalue == 0) {
-            e1->right = e1->right->left;
-            printf("[LOG] Peephole: replaced x = x - 0 with x = x.\n");
-        }
-        /* Παράδειγμα: x = 0 + x -> x = x */
-        if (e1->operator == ASSIGN && e1->right && e1->right->operator == PLUSOP &&
-            e1->right->left && e1->right->left->operator == CONSTANT && e1->right->left->constant->ivalue == 0) {
-            e1->right = e1->right->right;
-            printf("[LOG] Peephole: replaced x = 0 + x with x = x.\n");
-        }
-    }
+static int expr_uses(const expr_node *e, int idx) {
+    if (!e) return 0;
+    if (is_ident(e) && e->identifier->rec_index == idx) return 1;
+    if (expr_uses(e->left, idx) || expr_uses(e->right, idx)) return 1;
+    for (expr_list *L = e->expression_list; L; L = L->next)
+        if (expr_uses(L->expression, idx)) return 1;
+    return 0;
 }
 
-// ===================== CONTROL FLOW SIMPLIFICATION =====================
-static void control_flow_simplification(sub_struct *sub) {
-    // ...implementation from previous nested location...
-    instr_node *prev = NULL;
-    for (instr_node *i = sub->sub_first; i; ) {
-        /* Αφαίρεση περιττών jumps: αν μια εντολή είναι S_GOTO και ο επόμενος κόμβος είναι ο στόχος, αφαιρείται το jump */
-        if (i->type == S_GOTO && i->target == i->next) {
-            printf("[LOG] Control flow: removed redundant jump.\n");
-            if (prev) prev->next = i->next;
-            else sub->sub_first = i->next;
-            instr_node *tmp = i;
-            i = i->next;
-            free(tmp);
-            continue;
-        }
-        /* Συγχώνευση blocks: αν δύο διαδοχικά blocks δεν έχουν branches, συγχωνεύονται */
-        if (prev && prev->type == EXPRESSION && i->type == EXPRESSION) {
-            printf("[LOG] Control flow: merged consecutive blocks.\n");
-            prev->next = i->next;
-            free(i);
-            i = prev->next;
-            continue;
-        }
-        prev = i;
-        i = i->next;
-    }
+/* Effects of one statement on variables.
+ *   clobber_all: facts about every variable become invalid (call, store
+ *                through a pointer or array, nested assignment)
+ *   defs[]:      variables written directly (up to 8; more sets clobber_all) */
+typedef struct {
+    int clobber_all;
+    int ndefs;
+    int defs[8];
+} Effects;
+
+static void add_def(Effects *fx, int idx) {
+    for (int i = 0; i < fx->ndefs; i++)
+        if (fx->defs[i] == idx) return;
+    if (fx->ndefs < 8) fx->defs[fx->ndefs++] = idx;
+    else fx->clobber_all = 1;
 }
-extern int subroutine_number;
-extern sub_struct * subroutines[];
-extern int i_node_number;
 
-/* ===================== CONSTANT MAPPING ===================== */
-typedef struct ConstantMapping {
-    int rec_index;
-    const_struct *constant;
-    struct ConstantMapping *next;
-} ConstantMapping;
-
-static void add_mapping(ConstantMapping **map, int idx, const_struct *c) {
-    for (ConstantMapping *p = *map; p; p = p->next) {
-        if (p->rec_index == idx) {
-            p->constant = c;
-            return;
-        }
+static void collect_effects(const expr_node *e, Effects *fx, int top) {
+    if (!e) return;
+    if (e->operator == FUNCALL) fx->clobber_all = 1;
+    if (is_assign_op(e->operator)) {
+        if (is_ident(e->left)) add_def(fx, e->left->identifier->rec_index);
+        else fx->clobber_all = 1;
+        if (!top) fx->clobber_all = 1;  /* assignment inside an expression */
     }
-    ConstantMapping *n = malloc(sizeof *n);
+    if (is_incdec(e->operator)) {
+        if (is_ident(e->left)) add_def(fx, e->left->identifier->rec_index);
+        else fx->clobber_all = 1;
+    }
+    collect_effects(e->left, fx, 0);
+    collect_effects(e->right, fx, 0);
+    for (expr_list *L = e->expression_list; L; L = L->next) collect_effects(L->expression, fx, 0);
+}
+
+static Effects statement_effects(const instr_node *i) {
+    Effects fx;
+    memset(&fx, 0, sizeof fx);
+    if (i->expression) collect_effects(i->expression, &fx, 1);
+    if (i->type != EXPRESSION) fx.clobber_all = 1;  /* control or unknown instruction: assume the worst */
+    return fx;
+}
+
+/* Calls f(slot) for every identifier occurrence that may be rewritten:
+ * operands of + - * <<, the root of a right-hand side, and call arguments. */
+typedef void (*use_fn)(expr_node **slot, void *ctx);
+
+static void visit_value(expr_node **slot, use_fn f, void *ctx);
+
+static void visit_children(expr_node *e, use_fn f, void *ctx) {
+    if (!e) return;
+    if (is_pure_op(e->operator)) {
+        visit_value(&e->left, f, ctx);
+        visit_value(&e->right, f, ctx);
+    } else if (e->operator == FUNCALL) {
+        for (expr_list *L = e->expression_list; L; L = L->next) visit_value(&L->expression, f, ctx);
+    } else if (is_assign_op(e->operator)) {
+        visit_value(&e->right, f, ctx);  /* never the left-hand side */
+    }
+    /* any other operator: leave its operands alone */
+}
+
+static void visit_value(expr_node **slot, use_fn f, void *ctx) {
+    expr_node *e = *slot;
+    if (!e) return;
+    if (is_ident(e)) { f(slot, ctx); return; }
+    visit_children(e, f, ctx);
+}
+
+static void visit_statement_uses(instr_node *i, use_fn f, void *ctx) {
+    expr_node *e = i->expression;
+    if (!e) return;
+    if (is_assign_op(e->operator) || e->operator == FUNCALL || is_pure_op(e->operator)) visit_children(e, f, ctx);
+}
+
+static expr_node *new_ident_like(const expr_node *src) {
+    expr_node *n = malloc(sizeof *n);
     if (!n) { perror("malloc"); exit(1); }
-    n->rec_index = idx;
-    n->constant  = c;
-    n->next      = *map;
-    *map         = n;
+    *n = *src;
+    n->left = n->right = NULL;
+    n->expression_list = NULL;
+    return n;
 }
 
-static void remove_mapping(ConstantMapping **map, int idx) {
-    ConstantMapping *p = *map, *prev = NULL;
-    while (p) {
-        if (p->rec_index == idx) {
-            if (prev) prev->next = p->next;
-            else      *map      = p->next;
-            free(p);
-            return;
-        }
-        prev = p;
-        p = p->next;
-    }
+static expr_node *new_const_expr(const expr_node *like, const_struct *c) {
+    expr_node *n = malloc(sizeof *n);
+    if (!n) { perror("malloc"); exit(1); }
+    *n = *like;
+    n->operator = CONSTANT;
+    n->constant = c;
+    n->identifier = NULL;
+    n->left = n->right = NULL;
+    n->expression_list = NULL;
+    return n;
 }
 
-static const_struct* lookup_mapping(ConstantMapping *map, int idx) {
-    for (; map; map = map->next) {
-        if (map->rec_index == idx) {
-            return map->constant;
-        }
-    }
-    return NULL;
-}
-
-static void clear_mapping(ConstantMapping **map) {
-    ConstantMapping *p = *map;
-    while (p) {
-        ConstantMapping *nx = p->next;
-        free(p);
-        p = nx;
-    }
-    *map = NULL;
-}
-
-static void union_mappings(ConstantMapping **dest, ConstantMapping *src) {
-    for (; src; src = src->next) {
-        if (!lookup_mapping(*dest, src->rec_index)) {
-            add_mapping(dest, src->rec_index, src->constant);
-        }
-    }
-}
-
-static ConstantMapping* intersect_mappings(ConstantMapping *m1, ConstantMapping *m2) {
-    ConstantMapping *res = NULL;
-    for (; m1; m1 = m1->next) {
-        const_struct *c2 = lookup_mapping(m2, m1->rec_index);
-        if (!c2) continue;
-        int match = 0;
-        if (m1->constant->const_type == c2->const_type) {
-            switch (m1->constant->const_type) {
-              case TYPE_INT:
-                match = (m1->constant->ivalue == c2->ivalue);
-                break;
-              case TYPE_DOUBLE:
-                match = (m1->constant->fvalue == c2->fvalue);
-                break;
-              case TYPE_STRING:
-                match = (strcmp(m1->constant->svalue, c2->svalue) == 0);
-                break;
-              default:
-                match = (m1->constant == c2);
-            }
-        }
-        if (match) {
-            add_mapping(&res, m1->rec_index, m1->constant);
-        }
-    }
-    return res;
-}
-
-/* ===================== BASIC BLOCKS & CFG ===================== */
+/* ======================= basic blocks and CFG ======================= */
 typedef struct BasicBlock {
     int block_id;
     instr_node *start_instr, *end_instr;
     struct BasicBlock **succ;
     int succ_count;
+    struct BasicBlock **pred;
+    int pred_count;
     struct BasicBlock *next;
-
-    unsigned *dom;               /* Dominator bitvector */
-    ConstantMapping *entry_map;  /* CP mappings */
-    ConstantMapping *exit_map;
+    unsigned *dom;
 } BasicBlock;
 
-static int *instruction_to_block = NULL;
 static BasicBlock **block_by_id = NULL;
 static int nblocks = 0;
 
-/* 1) Δημιουργία Basic Blocks */
-static BasicBlock* create_basic_blocks(sub_struct *sub) {
-    if (!sub || !sub->sub_first) return NULL;
-    if (!instruction_to_block) {
-        instruction_to_block = malloc((i_node_number+1)*sizeof *instruction_to_block);
-        for (int i = 0; i <= i_node_number; i++) {
-            instruction_to_block[i] = -1;
-        }
+static int is_control(const instr_node *i) {
+    switch (i->type) {
+    case IF_BRANCH: case WHILE_LOOP: case FOR_LOOP: case DO_LOOP: case SELECT_BRANCH:
+    case S_GOTO: case S_BREAK: case S_CONTINUE: case S_RETURN:
+        return 1;
+    default:
+        return 0;
     }
-    instr_node *cur = sub->sub_first;
-    BasicBlock *head = NULL, *tail = NULL, *curr_bb = NULL;
+}
+
+static int instr_count(const sub_struct *sub) {
+    int n = 0;
+    for (instr_node *i = sub->sub_first; i; i = i->next) n++;
+    return n;
+}
+
+/* Index of an instruction in the sub_first list (-1 if absent). */
+static int instr_index(const sub_struct *sub, const instr_node *x) {
+    int n = 0;
+    for (instr_node *i = sub->sub_first; i; i = i->next, n++)
+        if (i == x) return n;
+    return -1;
+}
+
+static BasicBlock *block_of(const sub_struct *sub, const instr_node *x, int *instr_block) {
+    int k = x ? instr_index(sub, x) : -1;
+    return k >= 0 ? block_by_id[instr_block[k]] : NULL;
+}
+
+static BasicBlock *build_blocks(sub_struct *sub, int **instr_block_out) {
+    int n = instr_count(sub);
+    *instr_block_out = NULL;
     nblocks = 0;
-    while (cur) {
-        if (!curr_bb) {
-            curr_bb = calloc(1, sizeof *curr_bb);
-            curr_bb->block_id    = nblocks++;
-            curr_bb->start_instr = cur;
-            if (!head) head = curr_bb;
-            else        tail->next = curr_bb;
-            tail = curr_bb;
+    if (n == 0) return NULL;
+    char *leader = calloc(n, 1);
+    int *instr_block = malloc(n * sizeof *instr_block);
+    leader[0] = 1;
+    int k = 0;
+    for (instr_node *i = sub->sub_first; i; i = i->next, k++) {
+        if (is_control(i) && k + 1 < n) leader[k + 1] = 1;
+        const instr_node *t[3] = {i->target, i->instruction, i->tail_instruction};
+        for (int j = 0; j < 3; j++) {
+            int ti = t[j] ? instr_index(sub, t[j]) : -1;
+            if (ti >= 0) leader[ti] = 1;
         }
-        instruction_to_block[cur->node_i] = curr_bb->block_id;
-        curr_bb->end_instr = cur;
-        switch (cur->type) {
-          case IF_BRANCH: case WHILE_LOOP: case FOR_LOOP:
-          case DO_LOOP: case SELECT_BRANCH:
-          case S_GOTO: case S_BREAK: case S_CONTINUE:
-          case S_RETURN:
-            curr_bb = NULL;
-            break;
-          default:
-            break;
+        for (instr_list *L = i->target_list; L; L = L->next) {
+            int ti = L->instruction ? instr_index(sub, L->instruction) : -1;
+            if (ti >= 0) leader[ti] = 1;
         }
-        cur = cur->next;
     }
+    BasicBlock *head = NULL, *tail = NULL, *cur = NULL;
+    k = 0;
+    for (instr_node *i = sub->sub_first; i; i = i->next, k++) {
+        if (leader[k]) {
+            cur = calloc(1, sizeof *cur);
+            cur->block_id = nblocks++;
+            cur->start_instr = i;
+            if (!head) head = cur; else tail->next = cur;
+            tail = cur;
+        }
+        cur->end_instr = i;
+        instr_block[k] = cur->block_id;
+    }
+    free(leader);
     block_by_id = malloc(nblocks * sizeof *block_by_id);
-    for (BasicBlock *b = head; b; b = b->next) {
-        block_by_id[b->block_id] = b;
-    }
+    for (BasicBlock *b = head; b; b = b->next) block_by_id[b->block_id] = b;
+    *instr_block_out = instr_block;
     return head;
 }
 
-/* 2) Κατασκευή CFG */
-static void build_cfg(BasicBlock *head) {
+static void add_edge(BasicBlock *from, BasicBlock *to) {
+    if (!from || !to) return;
+    for (int i = 0; i < from->succ_count; i++)
+        if (from->succ[i] == to) return;
+    from->succ[from->succ_count++] = to;
+    to->pred[to->pred_count++] = from;
+    g_stats.edges++;
+}
+
+static void build_cfg(sub_struct *sub, BasicBlock *head, int *instr_block) {
     for (BasicBlock *b = head; b; b = b->next) {
-        b->succ = calloc(nblocks, sizeof *b->succ);
-        b->succ_count = 0;
+        b->succ = calloc(nblocks + 1, sizeof *b->succ);
+        b->pred = calloc(nblocks + 1, sizeof *b->pred);
     }
     for (BasicBlock *b = head; b; b = b->next) {
         instr_node *e = b->end_instr;
-        if (!e) continue;
-        #define ADD(id) do { BasicBlock *t = block_by_id[id]; \
-                              if (t) b->succ[b->succ_count++] = t; } while(0)
+        BasicBlock *fall = b->next;
         switch (e->type) {
-          case IF_BRANCH:
-            ADD(instruction_to_block[e->instruction->node_i]);
-            ADD(instruction_to_block[e->tail_instruction->node_i]);
+        case IF_BRANCH:
+            add_edge(b, block_of(sub, e->instruction, instr_block));
+            add_edge(b, e->tail_instruction ? block_of(sub, e->tail_instruction, instr_block) : fall);
             break;
-          case WHILE_LOOP: case FOR_LOOP: case DO_LOOP:
-            ADD(instruction_to_block[e->instruction->node_i]);
-            if (e->next) ADD(instruction_to_block[e->next->node_i]);
+        case WHILE_LOOP: case FOR_LOOP: case DO_LOOP:
+            add_edge(b, block_of(sub, e->instruction, instr_block));
+            add_edge(b, fall);
             break;
-          case SELECT_BRANCH: {
-            for (instr_list *L = e->target_list; L; L = L->next) {
-              if (L->instruction) {
-                ADD(instruction_to_block[L->instruction->node_i]);
-              }
-            }
-            if (e->tail_instruction)
-              ADD(instruction_to_block[e->tail_instruction->node_i]);
-            if (e->next)
-              ADD(instruction_to_block[e->next->node_i]);
+        case SELECT_BRANCH:
+            for (instr_list *L = e->target_list; L; L = L->next) add_edge(b, block_of(sub, L->instruction, instr_block));
+            add_edge(b, e->tail_instruction ? block_of(sub, e->tail_instruction, instr_block) : fall);
             break;
-          }
-          case S_GOTO:
-            if (e->target)
-              ADD(instruction_to_block[e->target->node_i]);
+        case S_GOTO:
+            add_edge(b, block_of(sub, e->target, instr_block));
             break;
-          case S_BREAK: case S_CONTINUE:
-            if (e->next)
-              ADD(instruction_to_block[e->next->node_i]);
+        case S_BREAK: case S_CONTINUE:
+            add_edge(b, e->target ? block_of(sub, e->target, instr_block) : fall);
             break;
-          case S_RETURN:
+        case S_RETURN:
             break;
-          default:
-            if (e->next)
-              ADD(instruction_to_block[e->next->node_i]);
+        default:
+            add_edge(b, fall);
             break;
         }
-        #undef ADD
     }
 }
 
-/* ===================== DOMINATORS ===================== */
+static void free_blocks(BasicBlock *head, int *instr_block) {
+    while (head) {
+        BasicBlock *nx = head->next;
+        free(head->succ);
+        free(head->pred);
+        free(head->dom);
+        free(head);
+        head = nx;
+    }
+    free(block_by_id);
+    block_by_id = NULL;
+    free(instr_block);
+    nblocks = 0;
+}
+
+/* ======================= dominators and natural loops ======================= */
 static void compute_dominators(BasicBlock *head) {
-    int B = nblocks, W = (B + WORD_SIZE - 1) / WORD_SIZE;
+    const int W = (int)((nblocks + WORD_SIZE - 1) / WORD_SIZE);
     for (BasicBlock *b = head; b; b = b->next) {
-        b->dom = calloc(W, sizeof *b->dom);
-        for (int i = 0; i < W; i++) {
-            b->dom[i] = ~0u;
-        }
+        b->dom = malloc(W * sizeof *b->dom);
+        for (int i = 0; i < W; i++) b->dom[i] = ~0u;
     }
     BasicBlock *start = block_by_id[0];
-    for (int i = 0; i < W; i++) {
-        start->dom[i] = 0;
-    }
-    start->dom[0] |= 1u << 0;
+    for (int i = 0; i < W; i++) start->dom[i] = 0;
+    start->dom[0] = 1u;
+    unsigned *newd = malloc(W * sizeof *newd);
     int changed;
     do {
         changed = 0;
         for (BasicBlock *b = head; b; b = b->next) {
             if (b == start) continue;
-            unsigned newd[W];
-            for (int i = 0; i < W; i++) newd[i] = ~0u;
-            for (BasicBlock *p = head; p; p = p->next) {
-                for (int k = 0; k < p->succ_count; k++) {
-                    if (p->succ[k] == b) {
-                        for (int i = 0; i < W; i++) {
-                            newd[i] &= p->dom[i];
-                        }
-                    }
-                }
-            }
+            for (int i = 0; i < W; i++) newd[i] = b->pred_count ? ~0u : 0u;
+            for (int p = 0; p < b->pred_count; p++)
+                for (int i = 0; i < W; i++) newd[i] &= b->pred[p]->dom[i];
             newd[b->block_id / WORD_SIZE] |= 1u << (b->block_id % WORD_SIZE);
-            for (int i = 0; i < W; i++) {
-                if (newd[i] != b->dom[i]) {
-                    b->dom[i] = newd[i];
-                    changed = 1;
-                }
-            }
+            for (int i = 0; i < W; i++)
+                if (newd[i] != b->dom[i]) { b->dom[i] = newd[i]; changed = 1; }
         }
     } while (changed);
+    free(newd);
 }
 
 static int dominates(int h, int b) {
-    BasicBlock *bb = block_by_id[b];
-    return (bb->dom[h / WORD_SIZE] >> (h % WORD_SIZE)) & 1;
+    return (block_by_id[b]->dom[h / WORD_SIZE] >> (h % WORD_SIZE)) & 1;
 }
 
-/* ===================== NATURAL LOOPS ===================== */
-typedef struct {
-    int header, latch;
-    unsigned *members;
-    int nmembers;
-} Loop;
-
-static Loop* detect_natural_loops(BasicBlock *head, int *nloops_out) {
-    compute_dominators(head);
-    int B = nblocks, W = (B + WORD_SIZE - 1) / WORD_SIZE;
-    Loop *loops = NULL;
-    int Lc = 0;
-    for (int b = 0; b < B; b++) {
-        BasicBlock *BB = block_by_id[b];
-        for (int i = 0; i < BB->succ_count; i++) {
-            int h = BB->succ[i]->block_id;
-            if (dominates(h, b)) {
-                loops = realloc(loops, (Lc+1)*sizeof *loops);
-                Loop *L = &loops[Lc++];
-                L->header   = h;
-                L->latch    = b;
-                L->members  = calloc(W, sizeof *L->members);
-                L->nmembers = 0;
-                int *stk = malloc(B * sizeof *stk), top = 0;
-                stk[top++] = b;
-                while (top) {
-                    int x = stk[--top];
-                    if (!((L->members[x / WORD_SIZE] >> (x % WORD_SIZE)) & 1)) {
-                        L->members[x / WORD_SIZE] |= 1u << (x % WORD_SIZE);
-                        L->nmembers++;
-                        for (int y = 0; y < B; y++) {
-                            BasicBlock *P = block_by_id[y];
-                            for (int k = 0; k < P->succ_count; k++) {
-                                if (P->succ[k]->block_id == x && dominates(h, y)) {
-                                    stk[top++] = y;
-                                }
-                            }
-                        }
-                    }
-                }
-                free(stk);
-                if (!((L->members[h / WORD_SIZE] >> (h % WORD_SIZE)) & 1)) {
-                    L->members[h / WORD_SIZE] |= 1u << (h % WORD_SIZE);
-                    L->nmembers++;
-                }
-            }
-        }
-    }
-    *nloops_out = Lc;
+/* Counts natural loops: one per back edge b -> h with h dominating b. */
+static int count_natural_loops(void) {
+    int loops = 0;
+    for (int b = 0; b < nblocks; b++)
+        for (int i = 0; i < block_by_id[b]->succ_count; i++)
+            if (dominates(block_by_id[b]->succ[i]->block_id, b)) loops++;
     return loops;
 }
 
-/* ===================== REGION HIERARCHY ===================== */
-typedef struct Region {
-    int region_id;
-    int *blocks;
-    int block_count;
-    struct Region *next;
-} Region;
+/* ======================= instruction sequences =======================
+ * The passes do not assume how the IR lays out the bodies of branches and
+ * loops. They collect every instruction reachable from sub_first through
+ * `next` and through the pointers of control instructions, as a set of
+ * sequences (runs linked by `next`). Facts are reset at every instruction
+ * that some instruction points to and after every control instruction, so
+ * facts never cross a possible jump in either direction. */
+typedef struct {
+    instr_node **node;   /* all instructions, sequence by sequence */
+    int *seq_start;      /* first index of each sequence */
+    int n, nseq, cap, seq_cap;
+    unsigned char *referenced;
+} Program;
 
-static Region* init_leaf_regions(void) {
-    Region *h = NULL, *t = NULL;
-    for (int i = 0; i < nblocks; i++) {
-        Region *r = malloc(sizeof *r);
-        r->region_id   = i;
-        r->blocks      = malloc(sizeof(int));
-        r->blocks[0]   = i;
-        r->block_count = 1;
-        r->next        = NULL;
-        if (!h) h = r; else t->next = r;
-        t = r;
-    }
-    return h;
+static int prog_find(const Program *p, const instr_node *x) {
+    for (int k = 0; k < p->n; k++)
+        if (p->node[k] == x) return k;
+    return -1;
 }
 
-static Region* build_region_hierarchy(BasicBlock *head) {
-    Region *R = init_leaf_regions();
-    int nloops;
-    Loop *loops = detect_natural_loops(head, &nloops);
-    for (int i = 0; i < nloops-1; i++) {
-        for (int j = i+1; j < nloops; j++) {
-            if (loops[i].nmembers > loops[j].nmembers) {
-                Loop tmp = loops[i]; loops[i] = loops[j]; loops[j] = tmp;
-            }
+static void prog_push(Program *p, instr_node *x) {
+    if (p->n == p->cap) {
+        p->cap = p->cap ? 2 * p->cap : 64;
+        p->node = realloc(p->node, p->cap * sizeof *p->node);
+    }
+    p->node[p->n++] = x;
+}
+
+static void prog_add_sequence(Program *p, instr_node *head) {
+    if (!head || prog_find(p, head) >= 0) return;
+    if (p->nseq + 2 > p->seq_cap) {
+        p->seq_cap = p->seq_cap ? 2 * p->seq_cap : 16;
+        p->seq_start = realloc(p->seq_start, p->seq_cap * sizeof *p->seq_start);
+    }
+    p->seq_start[p->nseq++] = p->n;
+    for (instr_node *i = head; i && prog_find(p, i) < 0; i = i->next) prog_push(p, i);
+}
+
+static void prog_build(Program *p, sub_struct *sub) {
+    memset(p, 0, sizeof *p);
+    prog_add_sequence(p, sub->sub_first);
+    for (int k = 0; k < p->n; k++) {  /* p->n grows while new sequences are found */
+        instr_node *i = p->node[k];
+        prog_add_sequence(p, i->target);
+        prog_add_sequence(p, i->instruction);
+        prog_add_sequence(p, i->tail_instruction);
+        for (instr_list *L = i->target_list; L; L = L->next) prog_add_sequence(p, L->instruction);
+    }
+    if (!p->seq_start) p->seq_start = malloc(sizeof *p->seq_start);
+    p->seq_start[p->nseq] = p->n;
+    p->referenced = calloc(p->n ? p->n : 1, 1);
+    for (int k = 0; k < p->n; k++) {
+        instr_node *i = p->node[k];
+        instr_node *ptrs[4] = {i->target, i->instruction, i->tail_instruction, i->parent};
+        for (int j = 0; j < 4; j++) {
+            int t = ptrs[j] ? prog_find(p, ptrs[j]) : -1;
+            if (t >= 0) p->referenced[t] = 1;
+        }
+        for (instr_list *L = i->target_list; L; L = L->next) {
+            int t = L->instruction ? prog_find(p, L->instruction) : -1;
+            if (t >= 0) p->referenced[t] = 1;
         }
     }
-    int rid = nblocks;
-    for (int i = 0; i < nloops; i++) {
-        Loop *L = &loops[i];
-        Region *body = malloc(sizeof *body);
-        body->region_id   = rid++;
-        body->block_count = L->nmembers;
-        body->blocks      = malloc(L->nmembers * sizeof(int));
-        int idx = 0;
-        for (int b = 0; b < nblocks; b++) {
-            if ((L->members[b / WORD_SIZE] >> (b % WORD_SIZE)) & 1) {
-                body->blocks[idx++] = b;
-            }
-        }
-        body->next = R; R = body;
-        Region *loopr = malloc(sizeof *loopr);
-        loopr->region_id   = rid++;
-        loopr->block_count = body->block_count;
-        loopr->blocks      = malloc(body->block_count * sizeof(int));
-        memcpy(loopr->blocks, body->blocks, body->block_count * sizeof(int));
-        loopr->next = R; R = loopr;
-    }
-    if (nloops == 0 || loops[nloops-1].nmembers < nblocks) {
-        Region *top = malloc(sizeof *top);
-        top->region_id   = rid++;
-        top->block_count = nblocks;
-        top->blocks      = malloc(nblocks * sizeof(int));
-        for (int i = 0; i < nblocks; i++) top->blocks[i] = i;
-        top->next = R; R = top;
-    }
-    for (int i = 0; i < nloops; i++) free(loops[i].members);
-    free(loops);
-    return R;
 }
 
-/* ===================== FORWARD DECLARATION ===================== */
-static void constant_propagation_in_region(Region *r, ConstantMapping *incoming_map);
-
-/* ===================== BLOCK-LEVEL CONSTANT PROPAGATION ===================== */
-static void propagate_expr(expr_node*, ConstantMapping*);
-static void handle_assignment_like(instr_node*, ConstantMapping**);
-static void handle_inc_dec(instr_node*, ConstantMapping**);
-
-static void constant_propagation_in_block(BasicBlock *bb,
-                                          ConstantMapping *in,
-                                          ConstantMapping **out) {
-    ConstantMapping *mp = NULL;
-    union_mappings(&mp, in);
-    instr_node *i = bb->start_instr, *e = bb->end_instr;
-    while (i) {
-        propagate_expr(i->expression, mp);
-        handle_assignment_like(i, &mp);
-        handle_inc_dec(i, &mp);
-        if (i == e) break;
-        i = i->next;
-    }
-    *out = mp;
+static void prog_free(Program *p) {
+    free(p->node);
+    free(p->seq_start);
+    free(p->referenced);
+    memset(p, 0, sizeof *p);
 }
 
-/* ===================== REGION-LEVEL CONSTANT PROPAGATION ===================== */
-static void constant_propagation_in_region(Region *r, ConstantMapping *incoming_map) {
-    ConstantMapping *running_map = NULL;
-    union_mappings(&running_map, incoming_map);
-    for (int i = 0; i < r->block_count; i++) {
-        int bid = r->blocks[i];
-        BasicBlock *bb = block_by_id[bid];
-        clear_mapping(&bb->entry_map);
-        union_mappings(&bb->entry_map, running_map);
-        ConstantMapping *bb_output = NULL;
-        constant_propagation_in_block(bb, bb->entry_map, &bb_output);
-        clear_mapping(&bb->exit_map);
-        union_mappings(&bb->exit_map, bb_output);
-        clear_mapping(&running_map);
-        union_mappings(&running_map, bb_output);
-    }
-}
-
-/* ===================== HANDLE ASSIGNMENT & INC/DEC ===================== */
-static void handle_assignment_like(instr_node *instr, ConstantMapping **map) {
-    expr_node *r = instr->expression;
-    if (!r) return;
-    oper_t op = r->operator;
-    if (op < ASSIGN || op > ASSIGNXOR) return;
-    expr_node *lhs = r->left, *rhs = r->right;
-    if (!lhs || !rhs || lhs->operator != IDENTIFIER || !lhs->identifier) return;
-    int idx = lhs->identifier->rec_index;
-    const_struct *old = lookup_mapping(*map, idx);
-    remove_mapping(map, idx);
-    if (old && rhs->operator == CONSTANT) {
-        unsigned long long v = old->ivalue;
-        switch (op) {
-          case ASSIGN:    v = rhs->constant->ivalue; break;
-          case ASSIGNADD: v += rhs->constant->ivalue; break;
-          case ASSIGNSUB: v -= rhs->constant->ivalue; break;
-          case ASSIGNMUL: v *= rhs->constant->ivalue; break;
-          case ASSIGNDIV: v /= rhs->constant->ivalue; break;
-          case ASSIGNMOD: v %= rhs->constant->ivalue; break;
-          case ASSIGNLSH: v <<= rhs->constant->ivalue; break;
-          case ASSIGNRSH: v >>= rhs->constant->ivalue; break;
-          case ASSIGNAND:v &= rhs->constant->ivalue; break;
-          case ASSIGNOR:  v |= rhs->constant->ivalue; break;
-          case ASSIGNXOR:v ^= rhs->constant->ivalue; break;
-          default: break;
-        }
-        const_struct *nc = malloc(sizeof *nc);
-        memset(nc, 0, sizeof *nc);
-        nc->const_type = old->const_type;
-        nc->ivalue     = v;
-        add_mapping(map, idx, nc);
-    }
-    else if (op == ASSIGN && rhs->operator == CONSTANT) {
-        add_mapping(map, idx, rhs->constant);
-    }
-}
-
-static void handle_inc_dec(instr_node *instr, ConstantMapping **map) {
-    expr_node *r = instr->expression;
-    if (!r) return;
-    oper_t op = r->operator;
-    if (op != PREINC && op != PREDEC && op != POSTINC && op != POSTDEC) return;
-    expr_node *c = r->left;
-    if (!c || c->operator != IDENTIFIER || !c->identifier) return;
-    int idx = c->identifier->rec_index;
-    const_struct *old = lookup_mapping(*map, idx);
-    remove_mapping(map, idx);
-    if (old) {
-        long long delta = (op == PREINC || op == POSTINC) ? 1 : -1;
-        unsigned long long v = old->ivalue + delta;
-        const_struct *nc = malloc(sizeof *nc);
-        memset(nc, 0, sizeof *nc);
-        nc->const_type = old->const_type;
-        nc->ivalue     = v;
-        add_mapping(map, idx, nc);
-    }
-}
-
-/* ===================== PROPAGATE EXPR ===================== */
-static void propagate_expr(expr_node *expr, ConstantMapping *map) {
-    if (!expr) return;
-    if (expr->operator == IDENTIFIER && expr->identifier) {
-        int idx = expr->identifier->rec_index;
-        const_struct *c = lookup_mapping(map, idx);
-        if (c) {
-            expr->operator   = CONSTANT;
-            expr->constant   = c;
-            /*expr->identifier = NULL; */
-            return;
-        }
-    }
-    if (expr->left)  propagate_expr(expr->left,  map);
-    if (expr->right) propagate_expr(expr->right, map);
-    for (expr_list *L = expr->expression_list; L; L = L->next) {
-        propagate_expr(L->expression, map);
-    }
-}
-
-/* ===================== DEAD CODE ELIMINATION ===================== */
-static void mark_uses_expr(expr_node *expr, unsigned *used) {
-    if (!expr) return;
-    if (expr->operator == IDENTIFIER && expr->identifier) {
-        used[expr->identifier->rec_index] = 1;
-    }
-    if (expr->left)  mark_uses_expr(expr->left,  used);
-    if (expr->right) mark_uses_expr(expr->right, used);
-    for (expr_list *L = expr->expression_list; L; L = L->next) {
-        mark_uses_expr(L->expression, used);
-    }
-}
-
-static void dead_code_elimination(sub_struct *sub) {
-    int max_rec = sub->items;
-    unsigned *used = calloc(max_rec, sizeof *used);
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        mark_uses_expr(i->expression, used);
-    }
-    instr_node *prev = NULL, *cur = sub->sub_first;
-    while (cur) {
-        int remove = 0;
-        expr_node *r = cur->expression;
-        if (r && r->operator == ASSIGN) {
-            expr_node *lhs = r->left;
-            if (lhs && lhs->operator == IDENTIFIER && lhs->identifier) {
-                int idx = lhs->identifier->rec_index;
-                if (!used[idx]) remove = 1;
-            }
-        }
-        if (remove) {
-            if (prev) prev->next = cur->next;
-            else       sub->sub_first = cur->next;
-            cur = cur->next;
-        } else {
-            prev = cur;
-            cur  = cur->next;
-        }
-    }
-    free(used);
-}
-
-/* ===================== MEMORY CLEANUP ===================== */
-static void free_regions(Region *r) {
-    while (r) {
-        Region *nx = r->next;
-        free(r->blocks);
-        free(r);
-        r = nx;
-    }
-}
-
-static void cleanup(BasicBlock *head, Region *regions, ConstantMapping *global_map) {
-    for (int i = 0; i < nblocks; i++) {
-        free(block_by_id[i]->dom);
-        free(block_by_id[i]->succ);
-        clear_mapping(&block_by_id[i]->entry_map);
-        clear_mapping(&block_by_id[i]->exit_map);
-    }
-    free(block_by_id);
-    free(instruction_to_block);
-    free_regions(regions);
-    clear_mapping(&global_map);
-}
-
-/* ===================== OPTIMIZE & MAIN ===================== */
-static void optimize_subroutine(sub_struct *sub) {
-    /* Control Flow Simplification */
-    printf("[DEBUG] Control flow simplification...\n");
-    control_flow_simplification(sub);
-    printf("[LOG] Control flow simplification complete.\n");
-    /* Peephole Optimization */
-    printf("[DEBUG] Peephole optimization...\n");
-    peephole_optimization(sub);
-    printf("[LOG] Peephole optimization complete.\n");
-    /* Inline Expansion */
-    printf("[DEBUG] Inline expansion...\n");
-    inline_expansion(sub);
-    printf("[LOG] Inline expansion complete.\n");
-    /* Common Subexpression Elimination */
-    printf("[DEBUG] Common subexpression elimination...\n");
-    common_subexpression_elimination(sub);
-    printf("[LOG] Common subexpression elimination complete.\n");
-    /* Strength Reduction */
-    printf("[DEBUG] Strength reduction...\n");
-    strength_reduction(sub);
-    printf("[LOG] Strength reduction complete.\n");
-    /* Loop-Invariant Code Motion */
-    printf("[DEBUG] Loop-invariant code motion...\n");
-    loop_invariant_code_motion(sub);
-    printf("[LOG] Loop-invariant code motion complete.\n");
-    /* Copy Propagation */
-    printf("[DEBUG] Copy propagation...\n");
-    copy_propagation(sub);
-    printf("[LOG] Copy propagation complete.\n");
-}
-
-void my_optimization(void) {
-    printf("[INFO] Starting optimization...\n");
-    for (int i = 0; i < subroutine_number; i++) {
-        if (subroutines[i]) {
-            int before = count_instructions(subroutines[i]);
-            printf("[INFO] Optimizing subroutine %d...\n", i);
-            optimize_subroutine(subroutines[i]);
-            int after = count_instructions(subroutines[i]);
-            printf("[REPORT] Subroutine %d: Instructions before = %d, after = %d, reduced = %d\n", i, before, after, before - after);
-            printf("[INFO] Dumping AST after optimization for subroutine %d...\n", i);
-            dump_ast();
-        } else {
-            fprintf(stderr, "[WARN] subroutine %d is NULL\n", i);
-        }
-    }
-    printf("[INFO] Optimization complete.\n");
-}
-
-// ===================== INSTRUCTION COUNTER =====================
-int count_instructions(sub_struct *sub) {
-    int count = 0;
-    for (instr_node *i = sub->sub_first; i; i = i->next) {
-        count++;
-    }
-    return count;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "[ERROR] Usage: %s <input.ir> <output.ir>\n", argv[0]);
+/* Removes node k if it can be unlinked safely: nobody points to it, and it is
+ * either inside a sequence (its predecessor is node k-1) or the subroutine head. */
+static int prog_unlink(Program *p, sub_struct *sub, int k) {
+    if (p->referenced[k]) return 0;
+    int first = 0;
+    for (int s = 0; s < p->nseq; s++)
+        if (p->seq_start[s] == k) first = 1;
+    instr_node *x = p->node[k];
+    if (!first) {
+        p->node[k - 1]->next = x->next;
         return 1;
     }
-    printf("[INFO] Loading IR from %s...\n", argv[1]);
-    if (load_intermediate(argv[1])) {
-        fprintf(stderr, "[ERROR] Failed to load IR\n");
+    if (sub->sub_first == x) {
+        sub->sub_first = x->next;
         return 1;
     }
-    printf("[INFO] Dumping AST before optimization...\n");
-    dump_ast();
-    my_optimization();
-    printf("[INFO] Dumping AST after all optimizations...\n");
-    dump_ast();
-    int ret = store_intermediate(argv[2]);
-    printf("[INFO] store_intermediate returned %d\n", ret);
-    if (ret) {
-        fprintf(stderr, "[ERROR] Failed to write %s\n", argv[2]);
-        return 1;
-    }
-    printf("[INFO] Wrote optimized IR to %s\n", argv[2]);
     return 0;
 }
 
-/* ===================== NEWLIB STUBS ===================== */
-/* Για να ικανοποιηθούν τα __getreent και __locale_ctype_ptr από libirloadstore.a */
+/* Local pass driver: calls step(i, reset) for every instruction in program
+ * order; reset is 1 when the facts collected so far must be discarded first. */
+typedef void (*step_fn)(instr_node *i, int reset, void *ctx);
+
+static void for_each_local(Program *p, step_fn step, void *ctx) {
+    for (int s = 0; s < p->nseq; s++) {
+        int reset = 1;
+        for (int k = p->seq_start[s]; k < p->seq_start[s + 1]; k++) {
+            instr_node *i = p->node[k];
+            if (p->referenced[k]) reset = 1;
+            step(i, reset, ctx);
+            reset = is_control(i);
+        }
+    }
+}
+
+/* ======================= 1. jump cleanup ======================= */
+static void jump_cleanup(sub_struct *sub) {
+    int removed;
+    do {
+        removed = 0;
+        Program p;
+        prog_build(&p, sub);
+        for (int k = 0; k < p.n; k++) {
+            instr_node *i = p.node[k];
+            if (i->type == S_GOTO && i->target && i->target == i->next && prog_unlink(&p, sub, k)) {
+                removed = 1;
+                g_stats.jumps_removed++;
+                break;  /* rebuild after every structural change */
+            }
+        }
+        prog_free(&p);
+    } while (removed);
+}
+
+/* ======================= 2. algebraic simplification ======================= */
+static int is_int_const(const expr_node *e, long long v) {
+    return e && e->operator == CONSTANT && e->constant && e->constant->const_type == TYPE_INT && e->constant->ivalue == v;
+}
+
+static void simplify_expr(expr_node **slot) {
+    expr_node *e = *slot;
+    if (!e || !is_pure_op(e->operator)) return;
+    simplify_expr(&e->left);
+    simplify_expr(&e->right);
+    expr_node *repl = NULL;
+    if (e->operator == PLUSOP && is_int_const(e->right, 0)) repl = e->left;
+    else if (e->operator == PLUSOP && is_int_const(e->left, 0)) repl = e->right;
+    else if (e->operator == MINUSOP && is_int_const(e->right, 0)) repl = e->left;
+    else if (e->operator == MULOP && is_int_const(e->right, 1)) repl = e->left;
+    else if (e->operator == MULOP && is_int_const(e->left, 1)) repl = e->right;
+    else if (e->operator == LSHIFT && is_int_const(e->right, 0)) repl = e->left;
+    if (repl) { *slot = repl; g_stats.simplified++; }
+}
+
+static void simplify_step(instr_node *i, int reset, void *ctx) {
+    (void)reset; (void)ctx;
+    expr_node *e = i->expression;
+    if (e && is_assign_op(e->operator)) simplify_expr(&e->right);
+}
+
+/* ======================= 3. constant propagation ======================= */
+typedef struct { int idx; const_struct *c; } ConstFact;
+typedef struct { ConstFact f[64]; int n; } ConstCtx;
+
+static const_struct *const_lookup(ConstCtx *ctx, int idx) {
+    for (int k = 0; k < ctx->n; k++)
+        if (ctx->f[k].idx == idx) return ctx->f[k].c;
+    return NULL;
+}
+
+static void const_kill(ConstCtx *ctx, int idx) {
+    for (int k = 0; k < ctx->n; k++)
+        if (ctx->f[k].idx == idx) { ctx->f[k] = ctx->f[--ctx->n]; return; }
+}
+
+static void const_use(expr_node **slot, void *vctx) {
+    const_struct *c = const_lookup(vctx, (*slot)->identifier->rec_index);
+    if (c) { *slot = new_const_expr(*slot, c); g_stats.constants_propagated++; }
+}
+
+static void const_step(instr_node *i, int reset, void *vctx) {
+    ConstCtx *ctx = vctx;
+    if (reset) ctx->n = 0;
+    visit_statement_uses(i, const_use, ctx);
+    Effects fx = statement_effects(i);
+    if (fx.clobber_all) { ctx->n = 0; return; }
+    for (int d = 0; d < fx.ndefs; d++) const_kill(ctx, fx.defs[d]);
+    expr_node *e = i->expression;
+    if (e && e->operator == ASSIGN && is_ident(e->left) && e->right && e->right->operator == CONSTANT &&
+        e->right->constant && ctx->n < 64) {
+        ctx->f[ctx->n].idx = e->left->identifier->rec_index;
+        ctx->f[ctx->n].c = e->right->constant;
+        ctx->n++;
+    }
+}
+
+/* ======================= 4. copy propagation ======================= */
+typedef struct { int dst; expr_node *src; } Copy;
+typedef struct { Copy v[64]; int n; } CopyCtx;
+
+static void copy_use(expr_node **slot, void *vctx) {
+    CopyCtx *ctx = vctx;
+    int idx = (*slot)->identifier->rec_index;
+    for (int k = 0; k < ctx->n; k++)
+        if (ctx->v[k].dst == idx) { *slot = new_ident_like(ctx->v[k].src); g_stats.copies_propagated++; return; }
+}
+
+static void copy_step(instr_node *i, int reset, void *vctx) {
+    CopyCtx *ctx = vctx;
+    if (reset) ctx->n = 0;
+    visit_statement_uses(i, copy_use, ctx);
+    Effects fx = statement_effects(i);
+    if (fx.clobber_all) { ctx->n = 0; return; }
+    for (int d = 0; d < fx.ndefs; d++)
+        for (int k = 0; k < ctx->n;)
+            if (ctx->v[k].dst == fx.defs[d] || ctx->v[k].src->identifier->rec_index == fx.defs[d]) ctx->v[k] = ctx->v[--ctx->n];
+            else k++;
+    expr_node *e = i->expression;
+    if (e && e->operator == ASSIGN && is_ident(e->left) && is_ident(e->right) &&
+        e->left->identifier->rec_index != e->right->identifier->rec_index && ctx->n < 64) {
+        ctx->v[ctx->n].dst = e->left->identifier->rec_index;
+        ctx->v[ctx->n].src = e->right;
+        ctx->n++;
+    }
+}
+
+/* ======================= 5. common-subexpression elimination ======================= */
+typedef struct { expr_node *lhs, *rhs; } Avail;
+typedef struct { Avail v[64]; int n; } CseCtx;
+
+static void cse_step(instr_node *i, int reset, void *vctx) {
+    CseCtx *ctx = vctx;
+    if (reset) ctx->n = 0;
+    expr_node *e = i->expression;
+    int candidate = i->type == EXPRESSION && e && e->operator == ASSIGN && is_ident(e->left) && e->right &&
+                    is_pure_op(e->right->operator) && is_pure_expr(e->right);
+    if (candidate)
+        for (int k = 0; k < ctx->n; k++)
+            if (expr_equal(ctx->v[k].rhs, e->right)) {
+                e->right = new_ident_like(ctx->v[k].lhs);
+                g_stats.cse++;
+                candidate = 0;  /* now a copy, not an expression */
+                break;
+            }
+    Effects fx = statement_effects(i);
+    if (fx.clobber_all) { ctx->n = 0; return; }
+    for (int d = 0; d < fx.ndefs; d++)
+        for (int k = 0; k < ctx->n;)
+            if (ctx->v[k].lhs->identifier->rec_index == fx.defs[d] || expr_uses(ctx->v[k].rhs, fx.defs[d])) ctx->v[k] = ctx->v[--ctx->n];
+            else k++;
+    if (candidate && !expr_uses(e->right, e->left->identifier->rec_index) && ctx->n < 64) {
+        ctx->v[ctx->n].lhs = e->left;
+        ctx->v[ctx->n].rhs = e->right;
+        ctx->n++;
+    }
+}
+
+/* ======================= 6. dead-code elimination ======================= */
+/* Variables are identified by rec_index, the index of their symbol record in
+ * the subroutine (0 .. sub->items-1), as in the CCC symbol tables. */
+static void mark_reads(const expr_node *e, unsigned char *read, int items, int is_lhs) {
+    if (!e) return;
+    if (is_ident(e)) {
+        if (!is_lhs) {
+            int idx = e->identifier->rec_index;
+            if (idx >= 0 && idx < items) read[idx] = 1;
+        }
+        return;
+    }
+    if (is_assign_op(e->operator)) {
+        mark_reads(e->left, read, items, e->operator == ASSIGN);  /* x += ... reads x */
+        mark_reads(e->right, read, items, 0);
+        return;
+    }
+    mark_reads(e->left, read, items, 0);
+    mark_reads(e->right, read, items, 0);
+    for (expr_list *L = e->expression_list; L; L = L->next) mark_reads(L->expression, read, items, 0);
+}
+
+static void dead_code_elimination(sub_struct *sub) {
+    const int items = sub->items;
+    if (items <= 0) return;
+    unsigned char *read = malloc(items);
+    int removed;
+    do {
+        removed = 0;
+        Program p;
+        prog_build(&p, sub);
+        memset(read, 0, items);
+        for (int k = 0; k < p.n; k++) mark_reads(p.node[k]->expression, read, items, 0);
+        for (int k = 0; k < p.n; k++) {
+            instr_node *i = p.node[k];
+            expr_node *e = i->expression;
+            int idx = (e && is_ident(e->left)) ? e->left->identifier->rec_index : -1;
+            if (i->type == EXPRESSION && e && e->operator == ASSIGN && idx >= 0 && idx < items && !read[idx] &&
+                !has_side_effects(e->right) && prog_unlink(&p, sub, k)) {
+                removed = 1;
+                g_stats.dead_removed++;
+                break;  /* rebuild after every structural change */
+            }
+        }
+        prog_free(&p);
+    } while (removed);
+    free(read);
+}
+
+/* ======================= driver ======================= */
+static void optimize_subroutine(sub_struct *sub) {
+    /* analysis (reported in the statistics) */
+    int *instr_block;
+    BasicBlock *head = build_blocks(sub, &instr_block);
+    if (head) {
+        build_cfg(sub, head, instr_block);
+        compute_dominators(head);
+        g_stats.blocks += nblocks;
+        g_stats.loops += count_natural_loops();
+        free_blocks(head, instr_block);
+    }
+
+    /* transformations */
+    jump_cleanup(sub);
+    Program p;
+    prog_build(&p, sub);
+    for_each_local(&p, simplify_step, NULL);
+    ConstCtx cc; cc.n = 0;
+    for_each_local(&p, const_step, &cc);
+    CopyCtx yc; yc.n = 0;
+    for_each_local(&p, copy_step, &yc);
+    CseCtx ec; ec.n = 0;
+    for_each_local(&p, cse_step, &ec);
+    prog_free(&p);
+    dead_code_elimination(sub);
+}
+
+void my_optimization(void) {
+    memset(&g_stats, 0, sizeof g_stats);
+    for (int i = 0; i < subroutine_number; i++) {
+        if (!subroutines[i]) {
+            fprintf(stderr, "[WARN] subroutine %d is NULL\n", i);
+            continue;
+        }
+        int before = instr_count(subroutines[i]);
+        optimize_subroutine(subroutines[i]);
+        int after = instr_count(subroutines[i]);
+        if (my_opt_verbose) printf("[REPORT] subroutine %d: %d top-level instructions before, %d after\n", i, before, after);
+    }
+    if (!my_opt_verbose) return;
+    printf("[REPORT] basic blocks %d, CFG edges %d, natural loops %d\n", g_stats.blocks, g_stats.edges, g_stats.loops);
+    printf("[REPORT] jumps removed %d, simplifications %d, constants propagated %d, copies propagated %d, "
+           "common subexpressions %d, dead assignments removed %d\n",
+           g_stats.jumps_removed, g_stats.simplified, g_stats.constants_propagated, g_stats.copies_propagated,
+           g_stats.cse, g_stats.dead_removed);
+}
+
+#ifndef MY_OPT_NO_MAIN
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <input.ir> <output.ir>\n", argv[0]);
+        return 1;
+    }
+    if (load_intermediate(argv[1])) {
+        fprintf(stderr, "[ERROR] failed to load %s\n", argv[1]);
+        return 1;
+    }
+    my_optimization();
+    dump_ast();
+    if (store_intermediate(argv[2])) {
+        fprintf(stderr, "[ERROR] failed to write %s\n", argv[2]);
+        return 1;
+    }
+    printf("[INFO] wrote optimized IR to %s\n", argv[2]);
+    return 0;
+}
+
+/* Newlib stubs required by libirloadstore.a (__getreent, __locale_ctype_ptr). */
 struct _reent { int _dummy; };
 static struct _reent _global_reent = { 0 };
-struct _reent* __getreent(void) { return &_global_reent; }
-void* __locale_ctype_ptr = NULL;
+struct _reent *__getreent(void) { return &_global_reent; }
+void *__locale_ctype_ptr = NULL;
+#endif

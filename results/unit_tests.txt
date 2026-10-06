@@ -1,0 +1,17 @@
+constant propagation
+constant propagation stops at a call
+constant propagation does not enter a loop body
+constant propagation does not cross a jump target
+copy propagation
+common-subexpression elimination
+common-subexpression elimination respects redefinitions
+dead-code elimination
+dead-code elimination repeats until nothing changes
+dead-code elimination keeps jump targets
+jump cleanup
+algebraic simplification
+no rewriting under other operators (address-of)
+a store through a pointer discards facts
+natural-loop analysis
+
+23/23 checks passed
