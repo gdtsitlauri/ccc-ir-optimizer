@@ -164,8 +164,97 @@ int for_forms(int n)
    return s + k;
 }
 
+/* loop-invariant expressions move before the loop, also out of a loop condition */
+int invariant_exprs(int a, int b, int n)
+{
+   int i, s;
+   s = 0;
+   for (i = 0; i < n && i < 40; i++) {
+      s = s + a * b + i;
+      if (i > a + 3) s = s - b * 4;
+   }
+   while (s < n * 3 && s > -1000 && s < 1000) s = s + (a - b) * 2 + 1;
+   return s;
+}
+
+/* an expression over a variable the loop changes must stay in the loop */
+int variant_exprs(int a, int n)
+{
+   int i, s, k;
+   s = 0;
+   k = a;
+   for (i = 0; i < n && i < 40; i++) {
+      s = s + k * 3;
+      k = k + 1;
+   }
+   return s + k;
+}
+
+/* nested loops: a * b leaves both loops, i * a only the inner one */
+int nested_invariant(int a, int b, int n)
+{
+   int i, j, s;
+   s = 0;
+   for (i = 0; i < n && i < 12; i++)
+      for (j = 0; j < n && j < 12; j++)
+         s = s + a * b + i * a + j;
+   return s;
+}
+
+/* x is 5 on every iteration: the iterative analysis finds it, the region summary
+   (x may be redefined in the loop) does not */
+int iterative_gain(int n)
+{
+   int i, x, s;
+   x = 5;
+   s = 0;
+   for (i = 0; i < n && i < 30; i++) {
+      s = s + x;
+      x = 5;
+   }
+   return s + x;
+}
+
+/* a division stays in its loop: moved before a loop that does not run, a / b
+   would divide by zero */
+int guarded_div(int a, int b, int n)
+{
+   int i, s;
+   s = 0;
+   for (i = 0; i < n && i < 10 && b != 0; i++) s = s + a / b;
+   return s;
+}
+
+/* a loop that is a case label is a jump target: nothing may be inserted before it */
+int loop_in_switch(int a, int b, int c)
+{
+   int i, s;
+   s = 1;
+   switch (c) {
+      case 0: s = 2;
+      case 1:
+         for (i = 0; i < 5; i++) s = s + a * b;
+         break;
+      default: s = 3;
+   }
+   return s;
+}
+
+/* algebraic identities */
+int algebra(int a, int b)
+{
+   int x, y, z, w;
+   x = a + 0;
+   y = 1 * b;
+   z = a * 0;
+   w = (b - 0) | 0;
+   return x + y + z + w + (a ^ 0) + (0 - b) + (a - 0);
+}
+
 int cases_top(int a, int b, int *out)
 {
    return loop_invariant(a, out) + loop_kill(a) + loops_jumps(a, b) + branches(a) + switches(a, b) + copies(a, b)
-        + cse_kill(a, b) + sequenced(a) + aliased(a) + folding(a) + chains(a) + for_forms(a);
+        + cse_kill(a, b) + sequenced(a) + aliased(a) + folding(a) + chains(a) + for_forms(a)
+        + invariant_exprs(a, b, a) + variant_exprs(a, b) + nested_invariant(a, b, b) + iterative_gain(a) + algebra(a, b)
+        + guarded_div(a, b, a) + loop_in_switch(a, b, a);
 }

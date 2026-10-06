@@ -1,23 +1,290 @@
-# Ada produced by the CCC translator before (<) and after (>) optimization, for the sample programs the
-# optimizer changes (package-name lines omitted). Declarations disappear because the translator drops unused variables.
+# Ada produced by the CCC translator from the original IR (<) and from the optimized IR (>, region-based mode)
+# for the sample programs the optimizer changes. licmN are the temporaries of loop-invariant code motion;
+# declarations of other variables disappear because the translator drops unused variables.
 
 == pythagoras_test
 <       V007_TEMP: INTEGER;
+>       licm8: INTEGER;
+>       licm9: INTEGER;
+>       licm10: INTEGER;
+>       licm11: INTEGER;
 <       V007_TEMP := 0;
+>          licm8 := V005_I * 100;
+>          licm9 := 10000 + (V005_I * 100);
+>          licm10 := 20000 + (V005_I * 100);
+>          licm11 := 30000 + (V005_I * 100);
+<             TEMPORARY000 := (V005_I * 100) + V006_J;
+>             TEMPORARY000 := licm8 + V006_J;
+<             TEMPORARY001 := (10000 + (V005_I * 100)) + V006_J;
+>             TEMPORARY001 := licm9 + V006_J;
+<             TEMPORARY002 := (20000 + (V005_I * 100)) + V006_J;
+>             TEMPORARY002 := licm10 + V006_J;
+<             TEMPORARY003 := (30000 + (V005_I * 100)) + V006_J;
+>             TEMPORARY003 := licm11 + V006_J;
+>       licm11: INTEGER;
+>       licm12: INTEGER;
+<       TEMPORARY012: INTEGER;
+<       TEMPORARY013: INTEGER;
+>          licm11 := V008_I - 1;
+>          licm12 := V008_I - 2;
+<             TEMPORARY002 := V008_I - 1;
+<             TEMPORARY003 := P05_PM(TEMPORARY002)(V009_J);
+<             TEMPORARY004 := V008_I - 2;
+<             TEMPORARY005 := V009_J - 2;
+<             TEMPORARY006 := P05_PM(TEMPORARY004)(TEMPORARY005);
+<             V007_P := (TEMPORARY003 / 2) + (TEMPORARY006 / 2);
+>             TEMPORARY002 := P05_PM(licm11)(V009_J);
+>             TEMPORARY003 := V009_J - 2;
+>             TEMPORARY004 := P05_PM(licm12)(TEMPORARY003);
+>             V007_P := (TEMPORARY002 / 2) + (TEMPORARY004 / 2);
+<                TEMPORARY007 := P04_K(V008_I)(V009_J);
+>                TEMPORARY005 := P04_K(V008_I)(V009_J);
+>                TEMPORARY006 := P03_A(V008_I)(V009_J);
+>                TEMPORARY007 := P02_S(V008_I)(V009_J);
+>                TEMPORARY007 := TEMPORARY007 + ((TEMPORARY005 * TEMPORARY006) * V007_P);
+>                P02_S(V008_I)(V009_J) := TEMPORARY007;
+<                TEMPORARY009 := P02_S(V008_I)(V009_J);
+<                TEMPORARY009 := TEMPORARY009 + ((TEMPORARY007 * TEMPORARY008) * V007_P);
+<                P02_S(V008_I)(V009_J) := TEMPORARY009;
+<                TEMPORARY010 := P03_A(V008_I)(V009_J);
+<                TEMPORARY011 := 1 - (TEMPORARY010 * V007_P);
+<                P05_PM(V008_I)(V009_J) := TEMPORARY011;
+>                TEMPORARY009 := 1 - (TEMPORARY008 * V007_P);
+>                P05_PM(V008_I)(V009_J) := TEMPORARY009;
+<             TEMPORARY012 := P02_S(INDEX000)(INDEX001);
+<             P02_S_out(INDEX000)(INDEX001) := TEMPORARY012;
+>             TEMPORARY010 := P02_S(INDEX000)(INDEX001);
+>             P02_S_out(INDEX000)(INDEX001) := TEMPORARY010;
+<             TEMPORARY013 := P05_PM(INDEX000)(INDEX001);
+<             P05_PM_out(INDEX000)(INDEX001) := TEMPORARY013;
+>             TEMPORARY011 := P05_PM(INDEX000)(INDEX001);
+>             P05_PM_out(INDEX000)(INDEX001) := TEMPORARY011;
 <       V006_SIDE: INTEGER;
 <       V006_SIDE := 5;
 <             V005_VOLUME := V005_VOLUME + ((V006_SIDE * V006_SIDE) * TEMPORARY000);
 >             V005_VOLUME := V005_VOLUME + (25 * TEMPORARY000);
 
-== rsa
-<       V004_aa: INTEGER;
-<       TEMPORARY000: INTEGER;
-<       if P01_a < 0 then
-<          TEMPORARY000 := -P01_a;
-<       else
-<          TEMPORARY000 := P01_a;
-<       end if;
-<       V004_aa := TEMPORARY000;
+== integer_lib
+>       licm9: INTEGER;
+<       TEMPORARY002: INTEGER;
+<       TEMPORARY003: INTEGER;
+>       licm9 := V004_n - 1;
+<          TEMPORARY000 := V004_n - 1;
+<          if V008_i = TEMPORARY000 then
+>          if V008_i = licm9 then
+<       TEMPORARY001 := V003_counter mod 2;
+<       if TEMPORARY001 = 1 then
+>       TEMPORARY000 := V003_counter mod 2;
+>       if TEMPORARY000 = 1 then
+>          licm9 := V004_n - 1;
+<             TEMPORARY002 := V004_n - 1;
+<             if V008_i = TEMPORARY002 then
+>             if V008_i = licm9 then
+<          TEMPORARY003 := V003_counter mod 2;
+<          if TEMPORARY003 = 1 then
+>          TEMPORARY001 := V003_counter mod 2;
+>          if TEMPORARY001 = 1 then
+>       licm9: INTEGER;
+<       TEMPORARY002: INTEGER;
+<       TEMPORARY003: INTEGER;
+>       licm9 := V004_n - 2;
+<          TEMPORARY000 := V004_n - 2;
+<          if V008_i = TEMPORARY000 then
+>          if V008_i = licm9 then
+<       TEMPORARY001 := V003_counter mod 2;
+<       if TEMPORARY001 = 1 then
+>       TEMPORARY000 := V003_counter mod 2;
+>       if TEMPORARY000 = 1 then
+>          licm9 := V004_n - 2;
+<             TEMPORARY002 := V004_n - 2;
+<             if V008_i = TEMPORARY002 then
+>             if V008_i = licm9 then
+<          TEMPORARY003 := V003_counter mod 2;
+<          if TEMPORARY003 = 1 then
+>          TEMPORARY001 := V003_counter mod 2;
+>          if TEMPORARY001 = 1 then
+>       licm12: INTEGER;
+>       licm13: INTEGER;
+<       TEMPORARY001: INTEGER;
+<       TEMPORARY002: INTEGER;
+>       TEMPORARY001: BOOLEAN;
+>       TEMPORARY002: BOOLEAN;
+<       TEMPORARY004: BOOLEAN;
+>       TEMPORARY004: INTEGER;
+<       TEMPORARY006: INTEGER;
+>       TEMPORARY006: BOOLEAN;
+<       TEMPORARY008: INTEGER;
+<       TEMPORARY009: BOOLEAN;
+<       TEMPORARY010: BOOLEAN;
+<       TEMPORARY011: INTEGER;
+<       TEMPORARY012: BOOLEAN;
+>       TEMPORARY008: BOOLEAN;
+>       licm12 := V006_n - 2;
+>       licm13 := V006_n - 1;
+<          TEMPORARY000 := V006_n - 2;
+<          if V007_i = TEMPORARY000 then
+>          if V007_i = licm12 then
+<          TEMPORARY001 := V006_n - 1;
+<          if V007_i = TEMPORARY001 then
+>          if V007_i = licm13 then
+<       TEMPORARY002 := V005_counter mod 2;
+<       if TEMPORARY002 = 1 then
+>       TEMPORARY000 := V005_counter mod 2;
+>       if TEMPORARY000 = 1 then
+<       TEMPORARY004 := V009_sinterm > 0;
+<       TEMPORARY003 := not TEMPORARY004;
+<       if TEMPORARY003 then
+<          TEMPORARY005 := V010_costerm > 0;
+<          TEMPORARY003 := TEMPORARY005;
+>       TEMPORARY002 := V009_sinterm > 0;
+>       TEMPORARY001 := not TEMPORARY002;
+>       if TEMPORARY001 then
+>          TEMPORARY003 := V010_costerm > 0;
+>          TEMPORARY001 := TEMPORARY003;
+<          TEMPORARY003 := not TEMPORARY003;
+>          TEMPORARY001 := not TEMPORARY001;
+<       while (TEMPORARY003) loop
+>       while (TEMPORARY001) loop
+>          licm12 := V006_n - 2;
+>          licm13 := V006_n - 1;
+<             TEMPORARY006 := V006_n - 2;
+<             if V007_i = TEMPORARY006 then
+>             if V007_i = licm12 then
+<             TEMPORARY007 := V006_n - 1;
+<             if V007_i = TEMPORARY007 then
+>             if V007_i = licm13 then
+<          TEMPORARY008 := V005_counter mod 2;
+<          if TEMPORARY008 = 1 then
+>          TEMPORARY004 := V005_counter mod 2;
+>          if TEMPORARY004 = 1 then
+<          TEMPORARY004 := V009_sinterm > 0;
+<          TEMPORARY003 := not TEMPORARY004;
+<          if TEMPORARY003 then
+<             TEMPORARY005 := V010_costerm > 0;
+<             TEMPORARY003 := TEMPORARY005;
+>          TEMPORARY002 := V009_sinterm > 0;
+>          TEMPORARY001 := not TEMPORARY002;
+>          if TEMPORARY001 then
+>             TEMPORARY003 := V010_costerm > 0;
+>             TEMPORARY001 := TEMPORARY003;
+<             TEMPORARY003 := not TEMPORARY003;
+>             TEMPORARY001 := not TEMPORARY001;
+<       TEMPORARY010 := V004_cosx > 5;
+<       TEMPORARY009 := not TEMPORARY010;
+<       if TEMPORARY009 then
+<          TEMPORARY011 := -5;
+<          TEMPORARY012 := V004_cosx < TEMPORARY011;
+<          TEMPORARY009 := TEMPORARY012;
+>       TEMPORARY006 := V004_cosx > 5;
+>       TEMPORARY005 := not TEMPORARY006;
+>       if TEMPORARY005 then
+>          TEMPORARY007 := -5;
+>          TEMPORARY008 := V004_cosx < TEMPORARY007;
+>          TEMPORARY005 := TEMPORARY008;
+<          TEMPORARY009 := not TEMPORARY009;
+>          TEMPORARY005 := not TEMPORARY005;
+<       if TEMPORARY009 then
+>       if TEMPORARY005 then
+>       licm12: INTEGER;
+>       licm13: INTEGER;
+<       TEMPORARY001: INTEGER;
+<       TEMPORARY002: INTEGER;
+>       TEMPORARY001: BOOLEAN;
+>       TEMPORARY002: BOOLEAN;
+<       TEMPORARY004: BOOLEAN;
+>       TEMPORARY004: INTEGER;
+<       TEMPORARY006: INTEGER;
+>       TEMPORARY006: BOOLEAN;
+<       TEMPORARY008: INTEGER;
+<       TEMPORARY009: BOOLEAN;
+<       TEMPORARY010: BOOLEAN;
+<       TEMPORARY011: INTEGER;
+<       TEMPORARY012: BOOLEAN;
+>       TEMPORARY008: BOOLEAN;
+>       licm12 := V006_n - 2;
+>       licm13 := V006_n - 1;
+<          TEMPORARY000 := V006_n - 2;
+<          if V007_i = TEMPORARY000 then
+>          if V007_i = licm12 then
+<          TEMPORARY001 := V006_n - 1;
+<          if V007_i = TEMPORARY001 then
+>          if V007_i = licm13 then
+<       TEMPORARY002 := V005_counter mod 2;
+<       if TEMPORARY002 = 1 then
+>       TEMPORARY000 := V005_counter mod 2;
+>       if TEMPORARY000 = 1 then
+<       TEMPORARY004 := V009_sinterm > 0;
+<       TEMPORARY003 := not TEMPORARY004;
+<       if TEMPORARY003 then
+<          TEMPORARY005 := V010_costerm > 0;
+<          TEMPORARY003 := TEMPORARY005;
+>       TEMPORARY002 := V009_sinterm > 0;
+>       TEMPORARY001 := not TEMPORARY002;
+>       if TEMPORARY001 then
+>          TEMPORARY003 := V010_costerm > 0;
+>          TEMPORARY001 := TEMPORARY003;
+<          TEMPORARY003 := not TEMPORARY003;
+>          TEMPORARY001 := not TEMPORARY001;
+<       while (TEMPORARY003) loop
+>       while (TEMPORARY001) loop
+>          licm12 := V006_n - 2;
+>          licm13 := V006_n - 1;
+<             TEMPORARY006 := V006_n - 2;
+<             if V007_i = TEMPORARY006 then
+>             if V007_i = licm12 then
+<             TEMPORARY007 := V006_n - 1;
+<             if V007_i = TEMPORARY007 then
+>             if V007_i = licm13 then
+<          TEMPORARY008 := V005_counter mod 2;
+<          if TEMPORARY008 = 1 then
+>          TEMPORARY004 := V005_counter mod 2;
+>          if TEMPORARY004 = 1 then
+<          TEMPORARY004 := V009_sinterm > 0;
+<          TEMPORARY003 := not TEMPORARY004;
+<          if TEMPORARY003 then
+<             TEMPORARY005 := V010_costerm > 0;
+<             TEMPORARY003 := TEMPORARY005;
+>          TEMPORARY002 := V009_sinterm > 0;
+>          TEMPORARY001 := not TEMPORARY002;
+>          if TEMPORARY001 then
+>             TEMPORARY003 := V010_costerm > 0;
+>             TEMPORARY001 := TEMPORARY003;
+<             TEMPORARY003 := not TEMPORARY003;
+>             TEMPORARY001 := not TEMPORARY001;
+<       TEMPORARY010 := V003_sinx > 5;
+<       TEMPORARY009 := not TEMPORARY010;
+<       if TEMPORARY009 then
+<          TEMPORARY011 := -5;
+<          TEMPORARY012 := V003_sinx < TEMPORARY011;
+<          TEMPORARY009 := TEMPORARY012;
+>       TEMPORARY006 := V003_sinx > 5;
+>       TEMPORARY005 := not TEMPORARY006;
+>       if TEMPORARY005 then
+>          TEMPORARY007 := -5;
+>          TEMPORARY008 := V003_sinx < TEMPORARY007;
+>          TEMPORARY005 := TEMPORARY008;
+<          TEMPORARY009 := not TEMPORARY009;
+>          TEMPORARY005 := not TEMPORARY005;
+<       if TEMPORARY009 then
+>       if TEMPORARY005 then
+
+== linedraw
+>       licm13: INTEGER;
+>       licm14: INTEGER;
+>       licm15: INTEGER;
+>       licm16: INTEGER;
+>             licm13 := V006_dy - V005_dx;
+<                   V011_error := V011_error + (V006_dy - V005_dx);
+>                   V011_error := V011_error + licm13;
+>             licm14 := V006_dy - V005_dx;
+<                   V011_error := V011_error + (V006_dy - V005_dx);
+>                   V011_error := V011_error + licm14;
+>             licm15 := V005_dx + V006_dy;
+<                   V011_error := V011_error + (V005_dx + V006_dy);
+>                   V011_error := V011_error + licm15;
+>             licm16 := V005_dx + V006_dy;
+<                   V011_error := V011_error + (V005_dx + V006_dy);
+>                   V011_error := V011_error + licm16;
 
 == mpeg1
 <       V032_down_for: INTEGER;
@@ -44,3 +311,57 @@
 >       V028_pred_temp_bit_vector := V030_recon_down_back / 2;
 <       P19_down_half_back := V030_recon_down_back - (V032_down_back * 2);
 >       P19_down_half_back := V030_recon_down_back - (V028_pred_temp_bit_vector * 2);
+>       licm81: INTEGER;
+>       licm82: INTEGER;
+>       licm83: INTEGER;
+>       licm84: INTEGER;
+>                licm81 := V046_i * 8;
+<                      TEMPORARY007 := (V046_i * 8) + V047_j;
+>                      TEMPORARY007 := licm81 + V047_j;
+<                      TEMPORARY012 := (V046_i * 8) + V047_j;
+>                      TEMPORARY012 := licm81 + V047_j;
+<                      TEMPORARY016 := (V046_i * 8) + V047_j;
+>                      TEMPORARY016 := licm81 + V047_j;
+<                      TEMPORARY022 := (V046_i * 8) + V047_j;
+>                      TEMPORARY022 := licm81 + V047_j;
+>                   licm82 := V048_k * 8;
+<                         TEMPORARY028 := (V048_k * 8) + V052_p;
+>                         TEMPORARY028 := licm82 + V052_p;
+<                         TEMPORARY033 := (V048_k * 8) + V052_p;
+>                         TEMPORARY033 := licm82 + V052_p;
+<                         TEMPORARY037 := (V048_k * 8) + V052_p;
+>                         TEMPORARY037 := licm82 + V052_p;
+<                         TEMPORARY043 := (V048_k * 8) + V052_p;
+>                         TEMPORARY043 := licm82 + V052_p;
+>                   licm83 := V049_l * 8;
+<                         TEMPORARY049 := (V049_l * 8) + V054_q;
+<                         TEMPORARY050 := (V049_l * 8) + V054_q;
+>                         TEMPORARY049 := licm83 + V054_q;
+>                         TEMPORARY050 := licm83 + V054_q;
+<                         TEMPORARY057 := (V049_l * 8) + V054_q;
+<                         TEMPORARY058 := (V049_l * 8) + V054_q;
+>                         TEMPORARY057 := licm83 + V054_q;
+>                         TEMPORARY058 := licm83 + V054_q;
+<                         TEMPORARY063 := (V049_l * 8) + V054_q;
+<                         TEMPORARY064 := (V049_l * 8) + V054_q;
+>                         TEMPORARY063 := licm83 + V054_q;
+>                         TEMPORARY064 := licm83 + V054_q;
+<                         TEMPORARY070 := (V049_l * 8) + V054_q;
+<                         TEMPORARY071 := (V049_l * 8) + V054_q;
+>                         TEMPORARY070 := licm83 + V054_q;
+>                         TEMPORARY071 := licm83 + V054_q;
+>                   licm84 := V050_m * 8;
+<                      TEMPORARY074 := (V050_m * 8) + V053_r;
+<                      TEMPORARY075 := (V050_m * 8) + V053_r;
+>                      TEMPORARY074 := licm84 + V053_r;
+>                      TEMPORARY075 := licm84 + V053_r;
+
+== rsa
+<       V004_aa: INTEGER;
+<       TEMPORARY000: INTEGER;
+<       if P01_a < 0 then
+<          TEMPORARY000 := -P01_a;
+<       else
+<          TEMPORARY000 := P01_a;
+<       end if;
+<       V004_aa := TEMPORARY000;

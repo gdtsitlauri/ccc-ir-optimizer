@@ -9,11 +9,12 @@
 # (TRANSLATOR, default "<ccc dir>/translator/c-to-ada translator.exe").
 #
 # For each program:
-#   1. translator -irstore prog.c            -> prog.ir   (skipped for a .ir input)
-#   2. my_opt prog.ir                        -> result.ir
-#   3. translator on prog.ir and result.ir   -> Ada; reports whether each completes
-#   4. ir_interp on prog.ir and result.ir, every function, RUNS seeds each;
-#      any difference in return value or observable memory is a mismatch
+#   1. translator -irstore prog.c       -> prog.ir   (skipped for a .ir input)
+#   2. my_opt prog.ir                   -> region.ir    (region-based constant propagation)
+#      my_opt prog.ir -iterative        -> iterative.ir (iterative constant propagation)
+#   3. translator on all three          -> Ada; reports whether each translation completes
+#   4. ir_interp on all three, every function, RUNS seeds each; any difference
+#      from the original in return value or observable memory is a mismatch
 # Work files go to build/run/<prog>/. Exit status 1 if any run mismatches.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,6 +28,11 @@ mkdir -p "$build/run"
 
 $CC -O2 -I"$LIB" "$here/src/my_opt.c" "$here/src/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/my_opt.exe" || exit 2
 $CC -O2 -I"$LIB" "$here/tests/ir_interp.c" "$here/src/newlib_stubs.c" "$LIB/libirloadstore.a" -o "$build/ir_interp.exe" || exit 2
+
+translated() { grep -q "translation completed" "$1" && echo completed || echo stopped; }
+results() { "$build/ir_interp.exe" "$1" "$RUNS" 1 all | grep " seed " > "$2"; }
+mismatches() { diff <(sed 's/ steps [0-9]*$//' "$1") <(sed 's/ steps [0-9]*$//' "$2") | grep -c '^<'; }
+steps() { awk '/ ok /{s += $NF} END {print s + 0}' "$1"; }
 
 status=0
 for src in "$@"; do
@@ -44,25 +50,25 @@ for src in "$@"; do
     esac
     if [ ! -f "$work/$name.ir" ]; then echo "$name: the translator did not produce IR"; status=1; continue; fi
 
-    (cd "$work" && "$build/my_opt.exe" "$name.ir" > opt.log 2>&1)
-    if [ ! -f "$work/result.ir" ]; then echo "$name: my_opt failed"; status=1; continue; fi
-
-    (cd "$work" && "$TRANSLATOR" "$name.ir" > ada_orig.log 2>&1; "$TRANSLATOR" result.ir > ada_opt.log 2>&1)
-    done_orig=$(grep -c "translation completed" "$work/ada_orig.log")
-    done_opt=$(grep -c "translation completed" "$work/ada_opt.log")
-
-    "$build/ir_interp.exe" "$work/$name.ir" "$RUNS" 1 all | grep " seed " > "$work/run_orig.txt"
-    "$build/ir_interp.exe" "$work/result.ir" "$RUNS" 1 all | grep " seed " > "$work/run_opt.txt"
-    mismatches=$(diff <(sed 's/ steps [0-9]*$//' "$work/run_orig.txt") <(sed 's/ steps [0-9]*$//' "$work/run_opt.txt") | grep -c '^<')
+    echo "== $name"
+    for mode in region iterative; do
+        flag=""; [ "$mode" = iterative ] && flag="-iterative"
+        (cd "$work" && rm -f result.ir && "$build/my_opt.exe" "$name.ir" $flag > "opt_$mode.log" 2>&1 && mv result.ir "$mode.ir")
+        if [ ! -f "$work/$mode.ir" ]; then echo "   $mode: my_opt failed"; status=1; continue 2; fi
+    done
+    (cd "$work" && for f in "$name" region iterative; do "$TRANSLATOR" "$f.ir" > "ada_$f.log" 2>&1; done)
+    results "$work/$name.ir" "$work/run_orig.txt"
+    sed -n 's/^\[REPORT\] /   /p' "$work/opt_region.log" | sed -n '1,2p'
+    echo "   Ada translation: original $(translated "$work/ada_$name.log"), region $(translated "$work/ada_region.log"), iterative $(translated "$work/ada_iterative.log")"
     runs=$(wc -l < "$work/run_orig.txt")
     ok=$(grep -c " ok " "$work/run_orig.txt")
-    steps_orig=$(awk '/ ok /{s += $NF} END {print s + 0}' "$work/run_orig.txt")
-    steps_opt=$(awk '/ ok /{s += $NF} END {print s + 0}' "$work/run_opt.txt")
-    [ "$mismatches" -ne 0 ] && status=1
-
-    echo "== $name"
-    sed -n 's/^\[REPORT\] /   /p' "$work/opt.log"
-    echo "   Ada translation: original $( [ "$done_orig" -gt 0 ] && echo completed || echo stopped ), optimized $( [ "$done_opt" -gt 0 ] && echo completed || echo stopped )"
-    echo "   interpreter: $runs runs ($ok complete), mismatches $mismatches, steps $steps_orig -> $steps_opt"
+    for mode in region iterative; do
+        results "$work/$mode.ir" "$work/run_$mode.txt"
+        m=$(mismatches "$work/run_orig.txt" "$work/run_$mode.txt")
+        [ "$m" -ne 0 ] && status=1
+        echo "   $mode:"
+        sed -n 's/^\[REPORT\] /      /p' "$work/opt_$mode.log" | sed -n '3,4p'
+        echo "      interpreter: $runs runs ($ok complete), mismatches $m, steps $(steps "$work/run_orig.txt") -> $(steps "$work/run_$mode.txt")"
+    done
 done
 exit $status

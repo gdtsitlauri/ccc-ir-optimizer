@@ -1,5 +1,6 @@
 # tests/native_cases.c: tests/cases.c compiled as C (-fwrapv -O2) vs ir_interp on its IR, same inputs, 200 seeds per function  (2026-10-06)
 
-functions 14, runs 2800
-native C vs interpreter on cases.ir (original):  0 differing runs
-native C vs interpreter on result.ir (optimized): 0 differing runs
+functions 21, runs 4200
+native C vs interpreter on cases.ir (original):         0 differing runs
+native C vs interpreter on region.ir (region-based):    0 differing runs
+native C vs interpreter on iterative.ir (iterative):    0 differing runs

@@ -1,14 +1,20 @@
-# tests/run_mutation.sh: each mutant (tests/mutants.txt) breaks one rule of src/my_opt.c; it is detected when
-# the interpreter finds a run whose result differs. RUNS=50 per function  (2026-10-06)
+# tests/run_mutation.sh: each mutant (tests/mutants.txt) breaks one rule of src/my_opt.c; it is detected when the
+# interpreter finds a run whose result differs, in either mode. RUNS=50 per function  (2026-10-06)
 
-loop-no-kill           detected  1155 differing runs (PS_RANDOM:100 cases:224 fir:100 integer_lib:202 linedraw:29 mpeg1:50 pythagoras_test:300 rsa:150)
-fold-plus-wrong        detected   100 differing runs (cases:100)
-if-no-meet             detected   120 differing runs (cases:26 mpeg1:94)
-copy-no-kill-src       detected   189 differing runs (cases:90 mpeg1:99)
-cse-no-kill-operand    detected   100 differing runs (cases:100)
-dce-ignores-reads      detected  1312 differing runs (PS_RANDOM:50 cases:517 differential:29 fir:50 integer_lib:137 linedraw:50 mpeg1:157 pythagoras_test:150 rsa:172)
-switch-label-no-join   detected    10 differing runs (cases:10)
-switch-exit-no-kill    detected   100 differing runs (cases:100)
-no-address-taken       detected   100 differing runs (cases:100)
-no-inner-effects       detected   100 differing runs (cases:100)
-10 of 10 mutants detected
+loop-no-kill               detected  1333 differing runs (PS_RANDOM/region:100 cases/region:402 fir/region:100 integer_lib/region:202 linedraw/region:29 mpeg1/region:50 pythagoras_test/region:300 rsa/region:150)
+fold-plus-wrong            detected   200 differing runs (cases/region:100 cases/iterative:100)
+if-no-meet                 detected   120 differing runs (cases/region:26 mpeg1/region:94)
+copy-no-kill-src           detected   378 differing runs (cases/region:90 cases/iterative:90 mpeg1/region:99 mpeg1/iterative:99)
+cse-no-kill-operand        detected   200 differing runs (cases/region:100 cases/iterative:100)
+dce-ignores-reads          detected  3161 differing runs (PS_RANDOM/region:50 PS_RANDOM/iterative:50 cases/region:742 cases/iterative:729 differential/region:29 differential/iterative:29 fir/region:50 fir/iterative:50 integer_lib/region:137 integer_lib/iterative:137 linedraw/region:50 linedraw/iterative:50 mpeg1/region:157 mpeg1/iterative:157 pythagoras_test/region:200 pythagoras_test/iterative:200 rsa/region:172 rsa/iterative:172)
+switch-label-no-join       detected    10 differing runs (cases/region:10)
+switch-exit-no-kill        detected   149 differing runs (cases/region:149)
+no-address-taken           detected   200 differing runs (cases/region:100 cases/iterative:100)
+no-inner-effects           detected   200 differing runs (cases/region:100 cases/iterative:100)
+simplify-zero-minus        detected   184 differing runs (cases/region:92 cases/iterative:92)
+iterative-ignores-back-edges detected   354 differing runs (cases/iterative:111 integer_lib/iterative:143 rsa/iterative:100)
+for-no-back-edge           detected  1282 differing runs (PS_RANDOM/iterative:100 cases/iterative:351 fir/iterative:100 integer_lib/iterative:202 linedraw/iterative:29 mpeg1/iterative:50 pythagoras_test/iterative:300 rsa/iterative:150)
+licm-ignores-loop-writes   detected  1728 differing runs (PS_RANDOM/region:50 PS_RANDOM/iterative:50 cases/region:332 cases/iterative:332 differential/region:8 differential/iterative:8 fir/region:100 fir/iterative:100 integer_lib/region:86 integer_lib/iterative:86 linedraw/region:38 linedraw/iterative:38 pythagoras_test/region:150 pythagoras_test/iterative:150 rsa/region:100 rsa/iterative:100)
+licm-moves-division        detected    16 differing runs (cases/region:8 cases/iterative:8)
+licm-at-jump-target        detected    18 differing runs (cases/region:9 cases/iterative:9)
+16 of 16 mutants detected

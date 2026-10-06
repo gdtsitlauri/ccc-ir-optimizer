@@ -60,6 +60,7 @@ static void report(const char *name, int seed, i64 ret, int with_buf) {
 /* arguments are drawn in parameter order, as ir_interp does */
 #define RUN1(f) do { seed_rng(s); int a = arg(); report(#f, s, f(a), 0); } while (0)
 #define RUN2(f) do { seed_rng(s); int a = arg(); int b = arg(); report(#f, s, f(a, b), 0); } while (0)
+#define RUN3(f) do { seed_rng(s); int a = arg(); int b = arg(); int c = arg(); report(#f, s, f(a, b, c), 0); } while (0)
 
 int main(int argc, char **argv) {
     int runs = argc > 1 ? atoi(argv[1]) : 100;
@@ -80,6 +81,13 @@ int main(int argc, char **argv) {
     for (int s = 1; s <= runs; s++) RUN1(folding);
     for (int s = 1; s <= runs; s++) RUN1(chains);
     for (int s = 1; s <= runs; s++) RUN1(for_forms);
+    for (int s = 1; s <= runs; s++) RUN3(invariant_exprs);
+    for (int s = 1; s <= runs; s++) RUN2(variant_exprs);
+    for (int s = 1; s <= runs; s++) RUN3(nested_invariant);
+    for (int s = 1; s <= runs; s++) RUN1(iterative_gain);
+    for (int s = 1; s <= runs; s++) RUN3(guarded_div);
+    for (int s = 1; s <= runs; s++) RUN3(loop_in_switch);
+    for (int s = 1; s <= runs; s++) RUN2(algebra);
     for (int s = 1; s <= runs; s++) {
         seed_rng(s);
         int a = arg(), b = arg();

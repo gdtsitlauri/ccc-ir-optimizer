@@ -1,7 +1,7 @@
 /* my_opt.c - optimizer for the intermediate representation (IR) of the CCC
  * high-level-synthesis toolchain (C front end translator, inter_library).
  *
- *   my_opt input.ir            reads input.ir, optimizes it, writes result.ir
+ *   my_opt input.ir [-iterative]    reads input.ir, optimizes it, writes result.ir
  *
  * The CCC IR is a syntax tree. A subroutine is a list of instruction nodes
  * linked by `next`; an if keeps its branches in `instruction` / `tail_instruction`,
@@ -16,23 +16,29 @@
  * locals table; globals with rec_index >= 0.
  *
  * Analyses (Aho, Lam, Sethi, Ullman, "Compilers", 2nd ed., chapter 9)
- *   - control-flow graph of the subroutine, one node per instruction
+ *   - control-flow graph of the subroutine: one node per instruction, three for a
+ *     for loop (initialization, condition, step)
  *   - dominators (iterative bit-vector algorithm, section 9.6.1)
  *   - natural loops (back edges whose head dominates their tail, section 9.6.6)
  *   - region hierarchy (section 9.7, Algorithm 9.52): statements are the leaf
  *     regions; the loop regions are ordered from the innermost outwards, and
  *     each one's summary, the set of variables it may define, is built from the
  *     summaries of the regions inside it and its own statements
+ *   - constant propagation, two ways: region-based (non-iterative, using the
+ *     region summaries) and iterative (sections 9.3-9.4, on the control-flow
+ *     graph until nothing changes). Both always run and are compared: every
+ *     constant the region-based analysis finds must be found, with the same
+ *     value, by the iterative one. Option -iterative makes the iterative result
+ *     the one applied; by default the region-based one is.
  *
  * Transformations
- *   1. region-based constant propagation with constant folding: facts flow
- *      through sequences and both branches of an if (meet = intersection, a
- *      branch that ends in a jump does not take part); on entry to a loop region
- *      its summary removes the facts of the variables it may define, so the
- *      facts at the loop head are found without iterating over the loop
- *   2. copy propagation: after x = y, later uses of x become y
- *   3. common-subexpression elimination: in x = e; ... z = e, the second becomes z = x
- *   4. dead-code elimination: an assignment to a variable that is never read,
+ *   1. constant propagation with constant folding and algebraic simplification
+ *      (x+0, x*1, x*0, ...)
+ *   2. loop-invariant code motion: an integer expression the loop cannot change
+ *      is computed once, into a new temporary, before the loop
+ *   3. copy propagation: after x = y, later uses of x become y
+ *   4. common-subexpression elimination: in x = e; ... z = e, the second becomes z = x
+ *   5. dead-code elimination: an assignment to a variable that is never read,
  *      with no side effect on the right-hand side, becomes an empty instruction
  *
  * Safety
@@ -46,9 +52,13 @@
  *     result fits in 32 bits, and / % << >> & | ^ only for non-negative operands
  *   - facts are discarded at goto targets, and a loop or switch that a goto can
  *     enter from outside has no facts at its exit
- *   - the shape of the tree never changes: nodes are rewritten in place and a
- *     removed instruction becomes an empty expression instruction, a form the
- *     front end itself produces
+ *   - code motion moves only expressions that cannot fail or have a side effect
+ *     (no division, memory access or call), and never before a loop that is a
+ *     jump target
+ *   - nodes are rewritten in place; a removed instruction becomes an empty
+ *     expression instruction, a form the front end itself produces; the only new
+ *     nodes are the instructions code motion inserts, whose temporaries are
+ *     added to the locals table and to the IR's name table (names_size)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,7 +84,8 @@ int my_opt_verbose = 1;
 
 typedef struct {
     int instructions, cfg_edges, back_edges, loop_regions, loop_statements;
-    int constants_propagated, folded, copies_propagated, cse, dead_removed;
+    int constants_propagated, folded, simplified, copies_propagated, cse, dead_removed, hoisted, temps;
+    int iterative_passes, iterative_gave_up, cmp_region, cmp_iterative, cmp_region_only, cmp_disagree, skipped;
 } OptStats;
 static OptStats g;
 
@@ -258,47 +269,104 @@ static void become_constant(expr_node *e, long long v) {
 }
 
 static void become_identifier(expr_node *e, const id_struct *id) {
-    drop_children(e);
     id_struct *copy = malloc(sizeof *copy);
     if (!copy) { perror("malloc"); exit(1); }
-    *copy = *id;
+    *copy = *id; /* before drop_children: id may belong to a child */
+    drop_children(e);
     e->operator = IDENTIFIER;
     e->identifier = copy;
 }
 
-/* ----- constant folding ----- */
+/* ----- constant folding and algebraic simplification ----- */
+static int in_int32(long long v) { return v >= -2147483647LL - 1 && v <= 2147483647LL; }
+
 static int int_const(const expr_node *e, long long *v) {
     if (!e || e->operator != CONSTANT || !int_kind(e->constant)) return 0;
     *v = (long long)e->constant->ivalue;
-    return *v >= -2147483647LL - 1 && *v <= 2147483647LL;
+    return in_int32(*v);
+}
+
+/* Nodes whose value folding may compute: signed integer arithmetic. */
+static int foldable_type(const expr_node *e) {
+    return (e->type & SCALAR_INT) && !(e->type & (NOT_SCALAR | TYPE_UNSIGNED));
+}
+
+/* a op b, when the result is the same as C's on 32-bit int and fits in it. */
+static int compute(oper_t op, long long a, long long b, long long *r) {
+    switch (op) {
+    case PLUSOP: *r = a + b; break;
+    case MINUSOP: *r = a - b; break;
+    case MULOP: *r = a * b; break;
+    case DIVOP: if (b <= 0 || a < 0) return 0; *r = a / b; break;
+    case MODOP: if (b <= 0 || a < 0) return 0; *r = a % b; break;
+    case LSHIFT: if (a < 0 || b < 0 || b > 30) return 0; *r = a << b; break;
+    case RSHIFT: if (a < 0 || b < 0 || b > 30) return 0; *r = a >> b; break;
+    case BITANDOP: if (a < 0 || b < 0) return 0; *r = a & b; break;
+    case BITOROP: if (a < 0 || b < 0) return 0; *r = a | b; break;
+    case XOROP: if (a < 0 || b < 0) return 0; *r = a ^ b; break;
+    case NEGOP: *r = -a; break;
+    default: return 0;
+    }
+    return in_int32(*r);
+}
+
+/* e takes the place of its operand x, which must have e's type: x's operator and
+ * children move into e, so e keeps its position in the tree. */
+static void become_operand(expr_node *e, expr_node *x) {
+    expr_node *other = x == e->left ? e->right : e->left;
+    if (other) delete_expression(other);
+    e->operator = x->operator;
+    e->structure = x->structure;
+    e->attribute = x->attribute;
+    e->left = x->left; /* the unions: left / constant / identifier, right / expression_list */
+    e->right = x->right;
+    if (!is_leaf(e->operator)) {
+        if (has_list(e->operator)) {
+            if (e->left) e->left->parent = e;
+            for (expr_list *l = e->expression_list; l; l = l->next) l->expression->parent = e;
+        } else {
+            if (e->left) e->left->parent = e;
+            if (e->right) e->right->parent = e;
+        }
+    }
+    /* x itself is not freed: the library allocates nodes, and its contents now belong to e */
+}
+
+/* Identities with one constant operand c and an operand x of the node's own type:
+ * x+0 0+x x-0 x*1 1*x x/1 x<<0 x>>0 x|0 0|x x^0 0^x become x; x*0 0*x x&0 0&x
+ * become 0 when x has no side effect. */
+static int simplify(expr_node *e) {
+    if (!e->left || !e->right) return 0;
+    long long c;
+    expr_node *x;
+    int const_left = int_const(e->left, &c);
+    if (const_left) x = e->right;
+    else if (int_const(e->right, &c)) x = e->left;
+    else return 0;
+    if (x->type != e->type) return 0;
+    int to_x = 0, to_zero = 0;
+    switch (e->operator) {
+    case PLUSOP: case BITOROP: case XOROP: to_x = c == 0; break;
+    case MINUSOP: case DIVOP: case LSHIFT: case RSHIFT: to_x = !const_left && c == (e->operator == DIVOP); break;
+    case MULOP: to_x = c == 1; to_zero = c == 0; break;
+    case BITANDOP: to_zero = c == 0; break;
+    default: break;
+    }
+    if (to_zero && !side_effects(x)) { become_constant(e, 0); return 1; }
+    if (!to_x) return 0;
+    become_operand(e, x);
+    return 1;
 }
 
 static void fold(expr_node *e) {
-    if (!e || is_leaf(e->operator) || has_list(e->operator)) return;
-    if (!(e->type & SCALAR_INT) || (e->type & (NOT_SCALAR | TYPE_UNSIGNED))) return;
-    long long a, b, r;
-    if (e->operator == NEGOP) {
-        if (!int_const(e->left, &a)) return;
-        r = -a;
-    } else {
-        if (!int_const(e->left, &a) || !int_const(e->right, &b)) return;
-        switch (e->operator) {
-        case PLUSOP: r = a + b; break;
-        case MINUSOP: r = a - b; break;
-        case MULOP: r = a * b; break;
-        case DIVOP: if (b <= 0 || a < 0) return; r = a / b; break;
-        case MODOP: if (b <= 0 || a < 0) return; r = a % b; break;
-        case LSHIFT: if (a < 0 || b < 0 || b > 30) return; r = a << b; break;
-        case RSHIFT: if (a < 0 || b < 0 || b > 30) return; r = a >> b; break;
-        case BITANDOP: if (a < 0 || b < 0) return; r = a & b; break;
-        case BITOROP: if (a < 0 || b < 0) return; r = a | b; break;
-        case XOROP: if (a < 0 || b < 0) return; r = a ^ b; break;
-        default: return;
-        }
+    if (!e || is_leaf(e->operator) || has_list(e->operator) || !foldable_type(e)) return;
+    long long a, b = 0, r;
+    if (int_const(e->left, &a) && (e->operator == NEGOP || int_const(e->right, &b)) && compute(e->operator, a, b, &r)) {
+        become_constant(e, r);
+        g.folded++;
+    } else if (simplify(e)) {
+        g.simplified++;
     }
-    if (r < -2147483647LL - 1 || r > 2147483647LL) return;
-    become_constant(e, r);
-    g.folded++;
 }
 
 static void fold_tree(expr_node *e);
@@ -435,26 +503,62 @@ static int entered_by_goto(instr_node *i) {
 /* ======================================================================
  * Control-flow graph, dominators, natural loops, region hierarchy
  * ====================================================================== */
+/* One node per instruction; a for loop has three: its initialization, its
+ * condition (the loop head) and its step. */
 #define MAXN 8192
 #define MAXE 65536
+enum { PART_MAIN, PART_INIT, PART_STEP };
 static instr_node *cfg_node[MAXN];
-static int ncfg;
+static int cfg_part[MAXN];
+static int ncfg, cfg_overflow;
 static int edge_from[MAXE], edge_to[MAXE], nedges;
 static int after_of[MAXN]; /* for a loop or switch: the node control reaches when it ends */
+static int cont_of[MAXN];  /* for a loop: the node continue goes to */
 
-static int cfg_id(const instr_node *i) {
+static int cfg_part_id(const instr_node *i, int part) {
     for (int k = 0; k < ncfg; k++)
-        if (cfg_node[k] == i) return k;
+        if (cfg_node[k] == i && cfg_part[k] == part) return k;
     return -1;
 }
+static int cfg_id(const instr_node *i) { return cfg_part_id(i, PART_MAIN); }
 
+static void add_node(instr_node *i, int part) {
+    if (ncfg >= MAXN - 1) { cfg_overflow = 1; return; }
+    cfg_node[ncfg] = i;
+    cfg_part[ncfg] = part;
+    ncfg++;
+}
 static void number_instr(instr_node *i, void *ctx) {
     (void)ctx;
-    if (ncfg < MAXN - 1 && cfg_id(i) < 0) cfg_node[ncfg++] = i;
+    if (cfg_id(i) >= 0) return;
+    add_node(i, PART_MAIN);
+    if (i->type == FOR_LOOP) {
+        add_node(i, PART_INIT);
+        add_node(i, PART_STEP);
+    }
+}
+
+/* The expression a node evaluates, or NULL. */
+static expr_node *node_expr(int k) {
+    instr_node *i = cfg_node[k];
+    if (!i) return NULL;
+    switch (i->type) {
+    case EXPRESSION: case S_RETURN: case IF_BRANCH: case WHILE_LOOP: case DO_LOOP: case SELECT_BRANCH:
+        return i->expression;
+    case FOR_LOOP: {
+        expr_list *l = i->ex_list; /* initialization, condition, step */
+        if (l && cfg_part[k] != PART_INIT) l = l->next;
+        if (l && cfg_part[k] == PART_STEP) l = l->next;
+        return l ? l->expression : NULL;
+    }
+    default:
+        return NULL;
+    }
 }
 
 static void add_edge(int a, int b) {
-    if (a < 0 || b < 0 || nedges >= MAXE) return;
+    if (a < 0 || b < 0) { cfg_overflow = 1; return; }
+    if (nedges >= MAXE) { cfg_overflow = 1; return; }
     for (int k = 0; k < nedges; k++)
         if (edge_from[k] == a && edge_to[k] == b) return;
     edge_from[nedges] = a;
@@ -462,15 +566,18 @@ static void add_edge(int a, int b) {
     nedges++;
 }
 
-/* Entry node of a statement list, or `cont` when it is empty. A do loop starts with its body. */
+/* Entry node of a statement list, or `cont` when it is empty. A do loop starts
+ * with its body, a for loop with its initialization. */
 static int entry_of(instr_node *seq, int cont) {
     if (!seq) return cont;
     if (seq->type == DO_LOOP && seq->instruction) return entry_of(seq->instruction, cfg_id(seq));
+    if (seq->type == FOR_LOOP) return cfg_part_id(seq, PART_INIT);
     return cfg_id(seq);
 }
 
 /* cont: the node control reaches after the list. break and continue name their
- * loop or switch statement; break leaves it, continue goes to its test. */
+ * loop or switch statement; break leaves it, continue goes to the loop's test
+ * (to the step, in a for loop). */
 static void build_cfg(instr_node *seq, int cont, int exit_node) {
     for (instr_node *i = seq; i; i = i->next) {
         int me = cfg_id(i);
@@ -484,16 +591,22 @@ static void build_cfg(instr_node *seq, int cont, int exit_node) {
             break;
         case WHILE_LOOP: case DO_LOOP:
             after_of[me] = after;
+            cont_of[me] = me;
             add_edge(me, entry_of(i->instruction, me));
             add_edge(me, after);
             build_cfg(i->instruction, me, exit_node);
             break;
-        case FOR_LOOP:
+        case FOR_LOOP: {
+            int init = cfg_part_id(i, PART_INIT), step = cfg_part_id(i, PART_STEP);
             after_of[me] = after;
-            add_edge(me, entry_of(i->tail_instruction, me));
+            cont_of[me] = step;
+            add_edge(init, me);
+            add_edge(me, entry_of(i->tail_instruction, step));
             add_edge(me, after);
-            build_cfg(i->tail_instruction, me, exit_node);
+            add_edge(step, me);
+            build_cfg(i->tail_instruction, step, exit_node);
             break;
+        }
         case SELECT_BRANCH:
             after_of[me] = after;
             for (instr_list *l = i->target_list; l; l = l->next) add_edge(me, entry_of(l->instruction, after));
@@ -510,7 +623,7 @@ static void build_cfg(instr_node *seq, int cont, int exit_node) {
         }
         case S_CONTINUE: {
             int t = i->target ? cfg_id(i->target) : -1;
-            add_edge(me, t >= 0 ? t : after);
+            add_edge(me, t >= 0 ? cont_of[t] : after);
             break;
         }
         case S_RETURN:
@@ -547,18 +660,24 @@ static void free_regions(void) {
     nregions = 0;
 }
 
-static void analyse_cfg(sub_struct *sub) {
+static int exit_node, entry_node;
+
+/* Builds the CFG and the region hierarchy. Returns 0 when the subroutine is too
+ * large for the tables, in which case it is left unoptimized. */
+static int analyse_cfg(sub_struct *sub) {
     free_regions();
     ncfg = 0;
     nedges = 0;
+    cfg_overflow = 0;
     for_each_instr(sub->sub_first, number_instr, NULL);
-    if (ncfg == 0) return;
-    const int exit_node = ncfg; /* virtual exit */
+    if (ncfg == 0 || cfg_overflow) return 0;
+    exit_node = ncfg; /* virtual exit */
     cfg_node[exit_node] = NULL;
-    for (int k = 0; k <= exit_node; k++) after_of[k] = exit_node;
+    for (int k = 0; k <= exit_node; k++) after_of[k] = cont_of[k] = exit_node;
     build_cfg(sub->sub_first, exit_node, exit_node);
+    if (cfg_overflow) return 0;
     const int n = exit_node + 1;
-    g.instructions += ncfg;
+    for (int k = 0; k < ncfg; k++) g.instructions += cfg_part[k] == PART_MAIN;
     g.cfg_edges += nedges;
 
     /* dominators (section 9.6.1): dom(entry) = {entry},
@@ -568,7 +687,7 @@ static void analyse_cfg(sub_struct *sub) {
     unsigned long long *tmp = malloc(sizeof(unsigned long long) * (size_t)W);
     unsigned char *has_pred = calloc((size_t)n, 1);
     if (!dom || !tmp || !has_pred) { perror("malloc"); exit(1); }
-    const int entry = entry_of(sub->sub_first, exit_node);
+    const int entry = entry_node = entry_of(sub->sub_first, exit_node);
     for (int k = 0; k < nedges; k++) has_pred[edge_to[k]] = 1;
     for (int b = 0; b < n; b++)
         for (int w = 0; w < W; w++) dom[b * W + w] = ~0ULL;
@@ -639,7 +758,7 @@ static void analyse_cfg(sub_struct *sub) {
         }
         DefCtx c = {regions[r].defs};
         for (int x = 0; x < ncfg; x++)
-            if (regions[r].members[x] && !covered[x]) for_each_expr(cfg_node[x], node_defs, &c);
+            if (regions[r].members[x] && !covered[x] && node_expr(x)) node_defs(node_expr(x), &c);
     }
     g.loop_regions += nregions;
     free(covered);
@@ -647,7 +766,9 @@ static void analyse_cfg(sub_struct *sub) {
     free(has_pred);
     free(tmp);
     free(dom);
+    return 1;
 }
+
 /* ======================================================================
  * 1. Region-based constant propagation with folding
  * ====================================================================== */
@@ -681,14 +802,49 @@ static void fact_meet(Facts *a, const Facts *b) { /* a := a meet b */
     }
 }
 
+/* What cp_expr does with a use whose value is known: rewrite it, record it (to
+ * compare analyses without changing the IR), or nothing (a transfer function). */
+enum { CP_REWRITE, CP_RECORD, CP_TRANSFER };
+static int cp_mode = CP_REWRITE;
+
+typedef struct { expr_node **node; long long *val; int n, cap; } UseLog;
+static UseLog *cp_log;
+static void log_use(UseLog *l, expr_node *id, long long c) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? 2 * l->cap : 256;
+        l->node = realloc(l->node, sizeof *l->node * (size_t)l->cap);
+        l->val = realloc(l->val, sizeof *l->val * (size_t)l->cap);
+        if (!l->node || !l->val) { perror("realloc"); exit(1); }
+    }
+    l->node[l->n] = id;
+    l->val[l->n] = c;
+    l->n++;
+}
+
 static void cp_use(expr_node *id, void *vs) {
     const Facts *s = vs;
     int v = var_of(id);
     long long c;
-    if (v && fact_get(s, v, &c)) {
+    if (!v || !fact_get(s, v, &c)) return;
+    if (cp_mode == CP_REWRITE) {
         become_constant(id, c);
         g.constants_propagated++;
+    } else if (cp_mode == CP_RECORD) {
+        log_use(cp_log, id, c);
     }
+}
+
+/* Value of e under the facts s, by the rules of fold: what e folds to once the
+ * known variables are replaced by their constants. */
+static int const_eval(const expr_node *e, const Facts *s, long long *v) {
+    if (!e) return 0;
+    if (e->operator == CONSTANT) return int_const(e, v);
+    if (e->operator == IDENTIFIER) return var_of(e) && fact_get(s, var_of(e), v) && in_int32(*v);
+    if (has_list(e->operator) || !foldable_type(e)) return 0;
+    long long a, b = 0;
+    if (!const_eval(e->left, s, &a)) return 0;
+    if (e->operator != NEGOP && !const_eval(e->right, s, &b)) return 0;
+    return compute(e->operator, a, b, v);
 }
 
 /* Variables written inside e before the value of e is complete: everything except
@@ -713,16 +869,16 @@ static void cp_expr(expr_node *e, Facts *s) {
     if (in.overflow) s->n = 0;
     for (int d = 0; d < in.n; d++) fact_kill(s, in.defs[d]);
     walk_uses(e, cp_use, s);
-    fold_tree(e);
+    if (cp_mode == CP_REWRITE) fold_tree(e);
+    expr_node *last = e;
+    while (last->operator == ASSIGN && last->right && last->right->operator == ASSIGN) last = last->right;
+    long long c;
+    int known = e->operator == ASSIGN && const_eval(last->right, s, &c);
     Effects fx = NO_EFFECTS;
     effects_of(e, &fx);
     if (fx.overflow) s->n = 0;
     for (int d = 0; d < fx.n; d++) fact_kill(s, fx.defs[d]);
-    if (e->operator != ASSIGN) return;
-    expr_node *last = e;
-    while (last->right && last->right->operator == ASSIGN) last = last->right;
-    long long c;
-    if (!int_const(last->right, &c)) return;
+    if (!known) return;
     for (expr_node *a = e;; a = a->right) {
         int v = var_of(a->left);
         if (v) fact_set(s, v, c);
@@ -850,6 +1006,110 @@ static void cp_seq(instr_node *i, Facts *s) {
 }
 
 /* ======================================================================
+ * 1b. Iterative constant propagation (sections 9.3 and 9.4: the iterative algorithm
+ *     on the control-flow graph, meet = intersection, until nothing changes)
+ * ====================================================================== */
+static int facts_equal(const Facts *a, const Facts *b) {
+    if (a->dead != b->dead || a->n != b->n) return 0;
+    for (int k = 0; k < a->n; k++) {
+        long long c;
+        if (!fact_get(b, a->f[k].v, &c) || c != a->f[k].c) return 0;
+    }
+    return 1;
+}
+
+/* the transfer function of node k */
+static void transfer(int k, Facts *s) {
+    expr_node *e = node_expr(k);
+    if (!e || s->dead) return;
+    int saved = cp_mode;
+    cp_mode = CP_TRANSFER;
+    cp_expr(e, s);
+    cp_mode = saved;
+}
+
+#define ITERATIVE_MAX_PASSES 10000
+
+/* Facts at the entry of every node, found iteratively; the caller frees them. */
+static Facts *iterative_in(void) {
+    const int n = exit_node + 1;
+    Facts *in = malloc(sizeof *in * (size_t)n), *out = malloc(sizeof *out * (size_t)n);
+    if (!in || !out) { perror("malloc"); exit(1); }
+    for (int k = 0; k < n; k++) { fact_jump(&in[k]); fact_jump(&out[k]); } /* top: not reached yet */
+    /* The meet and transfer functions are monotone, so the passes stop after at
+     * most (nodes x variables) changes; the cap is a guard against a bug, and
+     * giving up means knowing nothing anywhere, which is always safe. */
+    int changed = 1, passes = 0;
+    while (changed) {
+        changed = 0;
+        g.iterative_passes++;
+        if (++passes > ITERATIVE_MAX_PASSES) {
+            for (int k = 0; k < n; k++) fact_clear(&in[k]);
+            g.iterative_gave_up++;
+            break;
+        }
+        for (int b = 0; b < n; b++) {
+            Facts m;
+            if (b == entry_node) fact_clear(&m); /* nothing is known on entry */
+            else fact_jump(&m);
+            for (int e = 0; e < nedges; e++)
+                if (edge_to[e] == b) fact_meet(&m, &out[edge_from[e]]);
+            if (facts_equal(&m, &in[b])) continue;
+            in[b] = m;
+            out[b] = m;
+            transfer(b, &out[b]);
+            changed = 1;
+        }
+    }
+    free(out);
+    return in;
+}
+
+/* Rewrites (or records) every node's uses with the facts at its entry. */
+static void iterative_cp(int mode) {
+    Facts *in = iterative_in();
+    int saved = cp_mode;
+    cp_mode = mode;
+    for (int k = 0; k < ncfg; k++) {
+        if (!node_expr(k)) continue;
+        Facts s = in[k];
+        cp_expr(node_expr(k), &s);
+    }
+    cp_mode = saved;
+    free(in);
+}
+
+/* Region-based against iterative: the uses each analysis finds constant. The
+ * region-based summaries are coarser (they forget everything a loop may
+ * redefine), so every use it finds must be found by the iterative analysis too,
+ * with the same value. */
+static void compare_analyses(void) {
+    UseLog region = {0}, iter = {0};
+    Facts s;
+    fact_clear(&s);
+    cp_mode = CP_RECORD;
+    cp_log = &region;
+    cp_seq(S->sub_first, &s);
+    cp_log = &iter;
+    iterative_cp(CP_RECORD);
+    cp_mode = CP_REWRITE;
+    cp_log = NULL;
+    for (int a = 0; a < region.n; a++) {
+        int found = 0;
+        for (int b = 0; b < iter.n && !found; b++)
+            if (iter.node[b] == region.node[a]) {
+                found = 1;
+                if (iter.val[b] != region.val[a]) g.cmp_disagree++;
+            }
+        if (!found) g.cmp_region_only++;
+    }
+    g.cmp_region += region.n;
+    g.cmp_iterative += iter.n;
+    free(region.node); free(region.val);
+    free(iter.node); free(iter.val);
+}
+
+/* ======================================================================
  * 2-3. Copy propagation and common-subexpression elimination (straight-line)
  * ====================================================================== */
 typedef struct { int dst; expr_node *src; } Copy;
@@ -954,6 +1214,227 @@ static void local_seq(instr_node *i) {
 }
 
 /* ======================================================================
+ * 3b. Loop-invariant code motion (section 9.5 of the book, in a safe form)
+ *
+ * An integer expression whose variables the loop never writes has the same
+ * value on every iteration. It is computed once into a new temporary, by an
+ * instruction inserted before the loop, and the loop reads the temporary:
+ *
+ *   while (i < n) { s = s + a * b; ... }   ->   t = a * b; while (i < n) { s = s + t; ... }
+ *
+ * Only expressions that cannot fail or have a side effect are moved (no
+ * division, memory access or call), so computing one before a loop that runs
+ * zero times changes nothing. A loop that is a jump target is left alone, since
+ * the jump would skip an instruction inserted before it.
+ * ====================================================================== */
+static unsigned char *loop_defs;
+static int loop_defs_size;
+
+static int invariant(const expr_node *e) {
+    if (!e) return 0;
+    if (e->operator == CONSTANT) return int_kind(e->constant);
+    if (e->operator == IDENTIFIER) {
+        int v = var_of(e);
+        return v && v < loop_defs_size && !loop_defs[v];
+    }
+    if (!(e->type & SCALAR_INT) || (e->type & NOT_SCALAR)) return 0;
+    switch (e->operator) {
+    case PLUSOP: case MINUSOP: case MULOP: case LSHIFT: case RSHIFT: case BITANDOP: case BITOROP: case XOROP:
+        return invariant(e->left) && invariant(e->right);
+    case NEGOP: case CMPLOP:
+        return invariant(e->left);
+    default:
+        return 0;
+    }
+}
+
+static int has_variable(const expr_node *e) {
+    if (!e) return 0;
+    if (e->operator == IDENTIFIER) return 1;
+    if (e->operator == CONSTANT) return 0;
+    return has_variable(e->left) || (e->operator != NEGOP && e->operator != CMPLOP && has_variable(e->right));
+}
+
+/* A new local variable of type t, set up like an existing non-parameter local of
+ * that type; returns its index, or 0 when there is no such local to copy. */
+static int new_local(type_t t) {
+    sub_struct *sub = S;
+    if (sub->items >= MAX_LOCAL_IDS - 1) return 0;
+    int model = 0;
+    for (int k = sub->params + 1; k < sub->items && !model; k++)
+        if (sub->locals[k].type == t && !sub->locals[k].structure) model = k;
+    if (!model) return 0;
+    int k = sub->items++;
+    sub->locals[k] = sub->locals[model];
+    char *name = malloc(32);
+    if (!name) { perror("malloc"); exit(1); }
+    snprintf(name, 32, "licm%d", k);
+    sub->locals[k].name = name;
+    names_size += (int)strlen(name) + 1; /* the IR file stores every name in one table of this size */
+    sub->locals[k].address_used = 0;
+    unsigned char *grown = realloc(addr_taken, (size_t)sub->items + 1);
+    if (!grown) { perror("realloc"); exit(1); }
+    addr_taken = grown;
+    addr_taken[k] = 0;
+    g.temps++;
+    return k;
+}
+
+/* An identifier node for local k, copied from an identifier of an existing local. */
+static const id_struct *id_model;
+static expr_node *local_leaf(int k, type_t t) {
+    id_struct *id = malloc(sizeof *id);
+    if (!id) { perror("malloc"); exit(1); }
+    *id = *id_model;
+    id->type = t;
+    id->param = NOPARAM;
+    id->rec_index = -k;
+    expr_node *leaf = create_identifier_leaf(id);
+    leaf->type = t;
+    leaf->isbool = 0;
+    leaf->ada_type_index = -1;
+    return leaf;
+}
+
+typedef struct { expr_node *expr; int temp; } Hoisted;
+typedef struct { instr_node *loop; instr_node **link; Hoisted h[64]; int nh; } LicmCtx;
+
+/* Moves *slot out of the loop, or reuses the temporary of an equal expression. */
+static void hoist(expr_node **slot, LicmCtx *c) {
+    expr_node *e = *slot;
+    for (int k = 0; k < c->nh; k++)
+        if (c->h[k].expr->type == e->type && expr_equal(c->h[k].expr, e)) {
+            expr_node *leaf = local_leaf(c->h[k].temp, e->type);
+            become_identifier(e, leaf->identifier);
+            delete_expression(leaf);
+            g.hoisted++;
+            return;
+        }
+    if (c->nh == 64) return;
+    int t = new_local(e->type);
+    if (!t) return;
+    expr_node *use = local_leaf(t, e->type);
+    use->parent = e->parent;
+    use->index = e->index;
+    use->instruction = e->instruction;
+    *slot = use;
+    expr_node *target = local_leaf(t, e->type);
+    expr_node *assign = create_expr_node(ASSIGN, target, e);
+    assign->type = e->type;
+    assign->isbool = 0;
+    assign->ada_type_index = -1;
+    assign->parent = NULL;
+    target->parent = assign;
+    target->index = 0;
+    e->parent = assign;
+    e->index = 1;
+    instr_node *init = create_e_instr(EXPRESSION, assign);
+    init->sub = S;
+    init->parent = c->loop->parent;
+    set_instruction(assign, init);
+    init->next = c->loop;
+    *c->link = init;
+    c->link = &init->next;
+    c->h[c->nh].expr = e;
+    c->h[c->nh].temp = t;
+    c->nh++;
+    g.hoisted++;
+}
+
+static void hoist_slot(expr_node **slot, int lvalue, void *vc) {
+    expr_node *e = *slot;
+    if (!e || is_leaf(e->operator)) return;
+    if (!lvalue && invariant(e) && has_variable(e)) { hoist(slot, vc); return; }
+    for_children(e, hoist_slot, vc);
+}
+
+static void hoist_instr(instr_node *i, void *vc) {
+    switch (i->type) {
+    case EXPRESSION: case S_RETURN: case IF_BRANCH: case WHILE_LOOP: case DO_LOOP: case SELECT_BRANCH:
+        hoist_slot(&i->expression, 0, vc);
+        break;
+    case FOR_LOOP:
+        for (expr_list *l = i->ex_list; l; l = l->next) hoist_slot(&l->expression, 0, vc);
+        break;
+    default:
+        break;
+    }
+}
+
+static void mark_loop_def(expr_node *e, void *ctx) {
+    (void)ctx;
+    Effects fx = NO_EFFECTS;
+    effects_of(e, &fx);
+    if (fx.overflow) memset(loop_defs, 1, (size_t)loop_defs_size);
+    for (int d = 0; d < fx.n; d++)
+        if (fx.defs[d] < loop_defs_size) loop_defs[fx.defs[d]] = 1;
+}
+static void mark_loop_defs(instr_node *i, void *ctx) { for_each_expr(i, mark_loop_def, ctx); }
+
+/* *link holds the loop statement. */
+static void licm_loop(instr_node **link) {
+    LicmCtx c;
+    c.loop = *link;
+    c.link = link;
+    c.nh = 0;
+    loop_defs_size = S->items + 1;
+    loop_defs = calloc((size_t)loop_defs_size, 1);
+    if (!loop_defs) { perror("calloc"); exit(1); }
+    instr_node *loop = c.loop, *saved = loop->next;
+    loop->next = NULL; /* the loop statement and its nested statements only */
+    for_each_instr(loop, mark_loop_defs, NULL);
+    loop->next = saved;
+    if (loop->type == FOR_LOOP) { /* the initialization runs once: only the test and the step */
+        expr_list *l = loop->ex_list;
+        if (l && l->next) hoist_slot(&l->next->expression, 0, &c);
+        if (l && l->next && l->next->next) hoist_slot(&l->next->next->expression, 0, &c);
+        for_each_instr(loop->tail_instruction, hoist_instr, &c);
+    } else {
+        hoist_slot(&loop->expression, 0, &c);
+        for_each_instr(loop->instruction, hoist_instr, &c);
+    }
+    free(loop_defs);
+    loop_defs = NULL;
+}
+
+/* Walks a statement list through its links, outer loops before inner ones. */
+static void licm_list(instr_node **link) {
+    for (; *link; link = &(*link)->next) {
+        instr_node *i = *link;
+        int is_loop = i->type == WHILE_LOOP || i->type == DO_LOOP || i->type == FOR_LOOP;
+        if (is_loop && !is_target(i)) {
+            licm_loop(link);
+            while (*link != i) link = &(*link)->next; /* past the inserted instructions */
+        }
+        switch (i->type) {
+        case IF_BRANCH: licm_list(&i->instruction); licm_list(&i->tail_instruction); break;
+        case WHILE_LOOP: case DO_LOOP: licm_list(&i->instruction); break;
+        case FOR_LOOP: licm_list(&i->tail_instruction); break;
+        case SELECT_BRANCH: {
+            instr_node *body = switch_body(i); /* starts at a case label: nothing goes before it */
+            licm_list(&body);
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
+/* the identifier of a non-parameter local, as the model for new identifiers */
+static void find_id_model(expr_node *id, void *ctx) {
+    (void)ctx;
+    if (!id_model && var_of(id) && id->identifier->param == NOPARAM) id_model = id->identifier;
+}
+static void find_id_model_expr(expr_node *e, void *ctx) { walk_uses(e, find_id_model, ctx); }
+static void find_id_model_instr(instr_node *i, void *ctx) { for_each_expr(i, find_id_model_expr, ctx); }
+
+static void loop_invariant_code_motion(sub_struct *sub) {
+    id_model = NULL;
+    for_each_instr(sub->sub_first, find_id_model_instr, NULL);
+    if (id_model) licm_list(&sub->sub_first);
+}
+
+/* ======================================================================
  * 4. Dead-code elimination
  * ====================================================================== */
 static unsigned char *read_var;
@@ -1037,6 +1518,10 @@ static void find_address_slot(expr_node **slot, int lvalue, void *ctx) {
 }
 static void find_address_instr(instr_node *i, void *ctx) { for_each_expr(i, find_address_expr, ctx); }
 
+/* Which analysis rewrites the program: the region-based one (default) or the
+ * iterative one (option -iterative). Both always run and are compared. */
+int my_opt_iterative = 0;
+
 static void optimize_subroutine(sub_struct *sub) {
     S = sub;
     free(addr_taken);
@@ -1045,12 +1530,23 @@ static void optimize_subroutine(sub_struct *sub) {
     for_each_instr(sub->sub_first, find_address_instr, NULL);
     ngotos = nlabels = targets_overflow = 0;
     for_each_instr(sub->sub_first, collect_target, NULL);
+    if (!analyse_cfg(sub)) { /* too large for the tables: left as it is */
+        g.skipped++;
+        free(addr_taken);
+        addr_taken = NULL;
+        return;
+    }
     for_each_instr(sub->sub_first, count_loops, NULL);
-    analyse_cfg(sub);
 
-    Facts s;
-    fact_clear(&s);
-    cp_seq(sub->sub_first, &s);
+    compare_analyses();
+    if (my_opt_iterative) {
+        iterative_cp(CP_REWRITE);
+    } else {
+        Facts s;
+        fact_clear(&s);
+        cp_seq(sub->sub_first, &s);
+    }
+    loop_invariant_code_motion(sub);
     local_seq(sub->sub_first);
     dead_code_elimination(sub);
     free(addr_taken);
@@ -1064,12 +1560,20 @@ void my_optimization(void) {
         if (!sub || sub->library || !sub->sub_first) continue;
         optimize_subroutine(sub);
     }
+    free_regions();
     if (!my_opt_verbose) return;
-    printf("[REPORT] instructions %d, CFG edges %d, back edges %d (loop statements %d), loop regions %d\n",
-           g.instructions, g.cfg_edges, g.back_edges, g.loop_statements, g.loop_regions);
-    printf("[REPORT] constants propagated %d, expressions folded %d, copies propagated %d, "
+    printf("[REPORT] instructions %d, CFG edges %d, back edges %d (loop statements %d), loop regions %d, "
+           "functions skipped %d\n",
+           g.instructions, g.cfg_edges, g.back_edges, g.loop_statements, g.loop_regions, g.skipped);
+    printf("[REPORT] constant uses found: region-based %d, iterative %d (%d passes); "
+           "region-based uses the iterative analysis missed %d, values that differ %d, gave up %d\n",
+           g.cmp_region, g.cmp_iterative, g.iterative_passes, g.cmp_region_only, g.cmp_disagree,
+           g.iterative_gave_up);
+    printf("[REPORT] %s constant propagation: constants propagated %d, expressions folded %d, simplified %d\n",
+           my_opt_iterative ? "iterative" : "region-based", g.constants_propagated, g.folded, g.simplified);
+    printf("[REPORT] loop-invariant expressions moved %d (into %d new temporaries), copies propagated %d, "
            "common subexpressions %d, dead assignments removed %d\n",
-           g.constants_propagated, g.folded, g.copies_propagated, g.cse, g.dead_removed);
+           g.hoisted, g.temps, g.copies_propagated, g.cse, g.dead_removed);
 }
 
 #ifndef MY_OPT_NO_MAIN
@@ -1078,6 +1582,7 @@ int main(int argc, char *argv[]) {
         printf("No input IR file provided!\n");
         exit(1);
     }
+    if (argc > 2 && strcmp(argv[2], "-iterative") == 0) my_opt_iterative = 1;
     if (load_intermediate(argv[1])) {
         printf("Unable to read input IR file!\n");
         exit(1);
