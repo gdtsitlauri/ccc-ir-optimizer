@@ -1,0 +1,50 @@
+# tests/run_tests.sh on the course's sample programs and tests/programs/cases.c
+# CCC=<course files> RUNS=200 tests/run_tests.sh <program>.c ...   (2026-10-06)
+
+== differential
+   instructions 10, CFG edges 11, back edges 1 (loop statements 1), loop regions 1
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 0
+   Ada translation: original completed, optimized completed
+   interpreter: 200 runs (164 complete), mismatches 0, steps 38132 -> 38132
+== fir
+   instructions 13, CFG edges 15, back edges 2 (loop statements 2), loop regions 2
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 0
+   Ada translation: original completed, optimized completed
+   interpreter: 400 runs (400 complete), mismatches 0, steps 348600 -> 348600
+== integer_lib
+   instructions 121, CFG edges 153, back edges 20 (loop statements 16), loop regions 16
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 0
+   Ada translation: original completed, optimized completed
+   interpreter: 1000 runs (800 complete), mismatches 0, steps 22198589 -> 22198589
+== linedraw
+   instructions 83, CFG edges 94, back edges 8 (loop statements 4), loop regions 4
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 0
+   Ada translation: original completed, optimized completed
+   interpreter: 200 runs (134 complete), mismatches 0, steps 1205786 -> 1205786
+== mpeg1
+   instructions 234, CFG edges 283, back edges 12 (loop statements 9), loop regions 9
+   constants propagated 0, expressions folded 0, copies propagated 10, common subexpressions 0, dead assignments removed 2
+   Ada translation: original completed, optimized completed
+   interpreter: 800 runs (800 complete), mismatches 0, steps 478051 -> 477199
+== PS_RANDOM
+   instructions 16, CFG edges 18, back edges 2 (loop statements 2), loop regions 2
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 0
+   Ada translation: original completed, optimized completed
+   interpreter: 600 runs (400 complete), mismatches 0, steps 285572 -> 285572
+== pythagoras_test
+   instructions 45, CFG edges 57, back edges 12 (loop statements 10), loop regions 10
+   constants propagated 2, expressions folded 1, copies propagated 0, common subexpressions 0, dead assignments removed 2
+   Ada translation: original completed, optimized completed
+   interpreter: 1200 runs (1200 complete), mismatches 0, steps 592627691 -> 584626091
+== rsa
+   instructions 85, CFG edges 107, back edges 4 (loop statements 3), loop regions 3
+   constants propagated 0, expressions folded 0, copies propagated 0, common subexpressions 0, dead assignments removed 1
+   Ada translation: original completed, optimized completed
+   interpreter: 1000 runs (1000 complete), mismatches 0, steps 5164362 -> 4699062
+== cases
+   instructions 115, CFG edges 134, back edges 9 (loop statements 8), loop regions 8
+   constants propagated 31, expressions folded 17, copies propagated 3, common subexpressions 1, dead assignments removed 14
+   Ada translation: original stopped, optimized completed
+   interpreter: 2800 runs (2800 complete), mismatches 0, steps 714224 -> 661372
+
+exit status 0

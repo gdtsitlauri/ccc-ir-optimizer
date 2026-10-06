@@ -1,0 +1,12 @@
+# mutants.txt - one deliberate mistake per line: name@@original text@@replacement.
+# Each mutant breaks one rule the optimizer relies on; the differential test must detect it.
+loop-no-kill@@static void enter_loop_region(Facts *s, instr_node *loop) {@@static void enter_loop_region(Facts *s, instr_node *loop) { if (s) return;
+fold-plus-wrong@@        case PLUSOP: r = a + b; break;@@        case PLUSOP: r = a + b + (a == 3); break;
+if-no-meet@@        fact_meet(&t, &e);@@        (void)e;
+copy-no-kill-src@@        if (L->c[k].dst == v || var_of(L->c[k].src) == v) L->c[k] = L->c[--L->nc];@@        if (L->c[k].dst == v) L->c[k] = L->c[--L->nc];
+cse-no-kill-operand@@        if (var_of(L->lhs[k]) == v || expr_uses_var(L->rhs[k], v)) {@@        if (var_of(L->lhs[k]) == v) {
+dce-ignores-reads@@    if (!v || read_var[v] || side_effects(e->right)) return;@@    if (!v || side_effects(e->right)) return;
+switch-label-no-join@@            else if (is_label_of(i, b)) fact_meet(&cur, &head);@@            else if (is_label_of(i, b)) { if (cur.dead) cur = head; }
+switch-exit-no-kill@@        for_each_instr(i, kill_instr_defs, &out);@@        (void)out;
+no-address-taken@@    if (r->address_used || !addr_taken || addr_taken[k]) return 0;@@    if (r->address_used || !addr_taken) return 0;
+no-inner-effects@@static void inner_effects(expr_node *e, Effects *fx) {@@static void inner_effects(expr_node *e, Effects *fx) { if (e) return;

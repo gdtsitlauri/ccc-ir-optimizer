@@ -1,0 +1,46 @@
+# Ada produced by the CCC translator before (<) and after (>) optimization, for the sample programs the
+# optimizer changes (package-name lines omitted). Declarations disappear because the translator drops unused variables.
+
+== pythagoras_test
+<       V007_TEMP: INTEGER;
+<       V007_TEMP := 0;
+<       V006_SIDE: INTEGER;
+<       V006_SIDE := 5;
+<             V005_VOLUME := V005_VOLUME + ((V006_SIDE * V006_SIDE) * TEMPORARY000);
+>             V005_VOLUME := V005_VOLUME + (25 * TEMPORARY000);
+
+== rsa
+<       V004_aa: INTEGER;
+<       TEMPORARY000: INTEGER;
+<       if P01_a < 0 then
+<          TEMPORARY000 := -P01_a;
+<       else
+<          TEMPORARY000 := P01_a;
+<       end if;
+<       V004_aa := TEMPORARY000;
+
+== mpeg1
+<       V032_down_for: INTEGER;
+<          V028_pred_temp_bit_vector := V028_pred_temp_bit_vector * 2;
+>          V028_pred_temp_bit_vector := V027_recon_right_for * 2;
+<          V028_pred_temp_bit_vector := V028_pred_temp_bit_vector * 2;
+>          V028_pred_temp_bit_vector := V030_recon_down_for * 2;
+<       V028_pred_temp_bit_vector := V028_pred_temp_bit_vector * 21;
+>       V028_pred_temp_bit_vector := V027_recon_right_for * 21;
+<       V028_pred_temp_bit_vector := V028_pred_temp_bit_vector / 2;
+<       V032_down_for := V028_pred_temp_bit_vector;
+>       V028_pred_temp_bit_vector := V030_recon_down_for / 2;
+<       P19_down_half_for := V030_recon_down_for - (V032_down_for * 2);
+>       P19_down_half_for := V030_recon_down_for - (V028_pred_temp_bit_vector * 2);
+<       V032_down_back: INTEGER;
+<          V028_pred_temp_bit_vector := V028_pred_temp_bit_vector * 2;
+>          V028_pred_temp_bit_vector := V027_recon_right_back * 2;
+<          V028_pred_temp_bit_vector := V028_pred_temp_bit_vector * 2;
+>          V028_pred_temp_bit_vector := V030_recon_down_back * 2;
+<       V028_pred_temp_bit_vector := V028_pred_temp_bit_vector / 2;
+>       V028_pred_temp_bit_vector := V027_recon_right_back / 2;
+<       V028_pred_temp_bit_vector := V028_pred_temp_bit_vector / 2;
+<       V032_down_back := V028_pred_temp_bit_vector;
+>       V028_pred_temp_bit_vector := V030_recon_down_back / 2;
+<       P19_down_half_back := V030_recon_down_back - (V032_down_back * 2);
+>       P19_down_half_back := V030_recon_down_back - (V028_pred_temp_bit_vector * 2);

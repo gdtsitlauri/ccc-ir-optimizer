@@ -1,1 +1,0 @@
-5000 random programs, 4136 changed by the optimizer, 0 behaved differently after optimization

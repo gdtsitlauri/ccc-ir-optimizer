@@ -1,0 +1,14 @@
+# tests/mutation/run_mutation.sh: each mutant breaks one rule of my_opt.c (tests/mutation/mutants.txt);
+# a mutant is detected when the interpreter finds a run whose result differs. RUNS=50 per function.  (2026-10-06)
+
+loop-no-kill           detected  1155 differing runs (fir:100 integer_lib:202 linedraw:29 mpeg1:50 PS_RANDOM:100 pythagoras_test:300 rsa:150 cases:224)
+fold-plus-wrong        detected   100 differing runs (cases:100)
+if-no-meet             detected   120 differing runs (mpeg1:94 cases:26)
+copy-no-kill-src       detected   189 differing runs (mpeg1:99 cases:90)
+cse-no-kill-operand    detected   100 differing runs (cases:100)
+dce-ignores-reads      detected  1312 differing runs (differential:29 fir:50 integer_lib:137 linedraw:50 mpeg1:157 PS_RANDOM:50 pythagoras_test:150 rsa:172 cases:517)
+switch-label-no-join   detected    10 differing runs (cases:10)
+switch-exit-no-kill    detected   100 differing runs (cases:100)
+no-address-taken       detected   100 differing runs (cases:100)
+no-inner-effects       detected   100 differing runs (cases:100)
+10 of 10 mutants detected
