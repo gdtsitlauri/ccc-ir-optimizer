@@ -46,7 +46,7 @@ translator result.ir           Ada back end             ->  result.ada
 | common-subexpression elimination | in `y = a + b; z = a + b;` the second becomes `z = y` |
 | dead-code elimination | an assignment to a variable that is never read is removed |
 
-## What it does not do, and why
+## Limitations (reported as such)
 
 | not done | why |
 | --- | --- |
@@ -148,6 +148,6 @@ CCC=<ccc> tests/run_mutation.sh                     # after run_tests.sh
 gcc -fwrapv -O2 tests/native_cases.c -o native_cases && ./native_cases 200
 ```
 
-## Author
+## Author and license
 
-George David Tsitlauri, University of Thessaly.
+George David Tsitlauri, University of Thessaly. MIT license ([LICENSE](LICENSE)).
